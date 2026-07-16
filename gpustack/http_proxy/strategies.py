@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
 import asyncio
+import hashlib
 import logging
 import math
+import random
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -80,19 +82,6 @@ LIMITS = {
     "heavy": ClassLimits(max_running=1, max_waiting=0, max_kv=0.45),
 }
 
-# Cooldown / hysteresis
-_COOLDOWN_KV_HIGH = envs.LB_COOLDOWN_KV_HIGH
-_COOLDOWN_KV_LOW = envs.LB_COOLDOWN_KV_LOW
-_COOLDOWN_DURATION = envs.LB_COOLDOWN_DURATION
-
-# Idle bonus constants
-_IDLE_THRESHOLD = envs.LB_IDLE_BONUS_THRESHOLD
-_IDLE_PER_SEC = envs.LB_IDLE_BONUS_PER_SECOND
-_IDLE_MAX_HEAVY = envs.LB_IDLE_BONUS_MAX_HEAVY
-_IDLE_MAX_MEDIUM = envs.LB_IDLE_BONUS_MAX_MEDIUM
-_IDLE_MAX_SHORT = envs.LB_IDLE_BONUS_MAX_SHORT
-_IDLE_KV_THRESHOLD = envs.LB_IDLE_KV_THRESHOLD
-
 
 def classify_request(prompt_tokens: int, max_tokens: int) -> str:
     total = prompt_tokens + max_tokens
@@ -104,41 +93,346 @@ def classify_request(prompt_tokens: int, max_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Peak EWMA — exponentially weighted moving average for KV smoothing
+# ---------------------------------------------------------------------------
+
+
+class PeakEWMA:
+    """
+    Peak EWMA smooths per-instance KV cache usage.
+
+    Uses aggressive alpha when load is rising (fast reaction to overload)
+    and conservative alpha when falling (slow decay, remembers overload).
+    """
+
+    def __init__(self) -> None:
+        # instance_id -> ewma value (0.0 - 1.0)
+        self._ewma: Dict[int, float] = {}
+
+    def update(self, instance_id: int, current_kv: float) -> float:
+        prev = self._ewma.get(instance_id)
+
+        if prev is None:
+            self._ewma[instance_id] = current_kv
+            return current_kv
+
+        if current_kv >= prev:
+            # Rising — react fast
+            alpha = envs.LB_EWMA_ALPHA_RISE
+        else:
+            # Falling — decay slowly
+            alpha = envs.LB_EWMA_ALPHA_FALL
+
+        new_ewma = alpha * current_kv + (1 - alpha) * prev
+        self._ewma[instance_id] = new_ewma
+        return new_ewma
+
+    def get(self, instance_id: int) -> float:
+        return self._ewma.get(instance_id, 0.0)
+
+    def clear(self, instance_id: int) -> None:
+        self._ewma.pop(instance_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Consistent Hashing with Bounded Loads (CHWBL)
+# ---------------------------------------------------------------------------
+
+
+class ConsistentHashRing:
+    """
+    Consistent hashing ring with virtual nodes.
+
+    Each physical instance gets `vnodes` virtual positions on the ring.
+    Lookup hashes the key and finds the next virtual node clockwise.
+    Bounded loads: if the target instance is overloaded, walk to the next
+    available node on the ring.
+    """
+
+    def __init__(self, vnodes: int = 100) -> None:
+        self._vnodes = vnodes
+        # Sorted list of (hash_value, instance_id)
+        self._ring: List[Tuple[int, int]] = []
+        self._hash_map: Dict[int, List[int]] = {}  # instance_id -> [hash_values]
+
+    def _hash(self, key: str) -> int:
+        return int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16)
+
+    def add(self, instance_id: int) -> None:
+        # Remove old entries for this instance first
+        if instance_id in self._hash_map:
+            for hv in self._hash_map[instance_id]:
+                self._ring.remove((hv, instance_id))
+            del self._hash_map[instance_id]
+
+        hashes = []
+        for i in range(self._vnodes):
+            hv = self._hash(f"{instance_id}:{i}")
+            hashes.append(hv)
+            self._ring.append((hv, instance_id))
+        self._hash_map[instance_id] = hashes
+        self._ring.sort(key=lambda x: x[0])
+
+    def remove(self, instance_id: int) -> None:
+        if instance_id in self._hash_map:
+            for hv in self._hash_map[instance_id]:
+                self._ring.remove((hv, instance_id))
+            del self._hash_map[instance_id]
+
+    def get(
+        self,
+        key: str,
+        instance_ids: List[int],
+        is_overloaded: callable,
+    ) -> Optional[int]:
+        """
+        Find the instance for `key`, skipping overloaded instances.
+
+        Args:
+            key: the hash key (e.g., prefix digest)
+            instance_ids: currently available instances
+            is_overloaded: callable(instance_id) -> bool
+
+        Returns:
+            instance_id or None if all instances are overloaded
+        """
+        if not self._ring or not instance_ids:
+            return None
+
+        available = set(instance_ids)
+        key_hash = self._hash(key)
+
+        # Find starting position on the ring
+        idx = 0
+        for i, (hv, _) in enumerate(self._ring):
+            if hv >= key_hash:
+                idx = i
+                break
+        else:
+            idx = 0  # wrap around
+
+        # Walk the ring clockwise
+        visited = set()
+        for _ in range(len(self._ring)):
+            hv, inst_id = self._ring[idx % len(self._ring)]
+            idx += 1
+
+            if inst_id not in available:
+                continue
+            if inst_id in visited:
+                # Full circle — no available instance
+                return None
+            visited.add(inst_id)
+
+            if not is_overloaded(inst_id):
+                return inst_id
+
+        return None
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self._ring) == 0
+
+
+# ---------------------------------------------------------------------------
+# Circuit Breaker per-instance
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreaker:
+    """
+    Per-instance circuit breaker with states: CLOSED, OPEN, HALF-OPEN.
+
+    - CLOSED: normal operation
+    - OPEN: instance is excluded (tripped by high KV or error)
+    - HALF-OPEN: after timeout, allow one probe request
+    """
+
+    def __init__(self) -> None:
+        # instance_id -> state string
+        self._state: Dict[int, str] = {}
+        # instance_id -> monotonic timestamp when state changed
+        self._changed_at: Dict[int, float] = {}
+
+    def _get_state(self, instance_id: int) -> str:
+        return self._state.get(instance_id, "CLOSED")
+
+    def should_allow(self, instance_id: int, now: float) -> bool:
+        state = self._get_state(instance_id)
+
+        if state == "CLOSED":
+            return True
+        if state == "OPEN":
+            changed = self._changed_at.get(instance_id, 0)
+            if now - changed >= envs.LB_CIRCUIT_BREAKER_TIMEOUT:
+                self._state[instance_id] = "HALF-OPEN"
+                self._changed_at[instance_id] = now
+                return True  # allow probe
+            return False
+        # HALF-OPEN — allow probe
+        return True
+
+    def record_success(self, instance_id: int, now: float) -> None:
+        self._state[instance_id] = "CLOSED"
+        self._changed_at[instance_id] = now
+
+    def record_failure(self, instance_id: int, now: float) -> None:
+        if self._get_state(instance_id) == "HALF-OPEN":
+            # Probe failed — go back to OPEN
+            self._state[instance_id] = "OPEN"
+        else:
+            self._state[instance_id] = "OPEN"
+        self._changed_at[instance_id] = now
+
+    def trip(self, instance_id: int, now: float) -> None:
+        """Explicitly trip the circuit (e.g., KV threshold exceeded)."""
+        self._state[instance_id] = "OPEN"
+        self._changed_at[instance_id] = now
+
+    def clear(self, instance_id: int) -> None:
+        self._state.pop(instance_id, None)
+        self._changed_at.pop(instance_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Slow Start — gradually increase weight after idle period
+# ---------------------------------------------------------------------------
+
+
+class SlowStart:
+    """
+    Slow Start gives progressively increasing weight to instances
+    that have been idle, ramping up over a configurable window.
+
+    Weight goes from 0 (just became idle) to 1 (fully warmed up).
+    """
+
+    def __init__(self) -> None:
+        # instance_id -> monotonic timestamp when instance became idle
+        self._idle_since: Dict[int, float] = {}
+        # instance_id -> whether currently tracking (idle)
+        self._tracking: Dict[int, bool] = {}
+
+    def mark_active(self, instance_id: int) -> None:
+        """Instance received a request — stop tracking."""
+        self._tracking.pop(instance_id, None)
+        self._idle_since.pop(instance_id, None)
+
+    def mark_idle(self, instance_id: int, now: float) -> None:
+        """Instance became idle — start tracking."""
+        if not self._tracking.get(instance_id, False):
+            self._tracking[instance_id] = True
+            self._idle_since[instance_id] = now
+
+    def get_weight(self, instance_id: int, now: float) -> float:
+        """
+        Return slow-start weight (0.0 - 1.0).
+
+        Returns 0 if instance is not being tracked (active).
+        Returns 1 if fully warmed up (idle for >= window seconds).
+        """
+        if not self._tracking.get(instance_id, False):
+            return 0.0
+
+        idle_since = self._idle_since.get(instance_id)
+        if idle_since is None:
+            return 0.0
+
+        window = envs.LB_SLOW_START_WINDOW
+        elapsed = now - idle_since
+
+        if elapsed >= window:
+            return 1.0
+        if elapsed <= 0:
+            return 0.0
+
+        progress = elapsed / window
+        aggression = envs.LB_SLOW_START_AGGRESSION
+
+        # power function: progress^aggression
+        # aggression=1.0 -> linear, >1 -> convex (slower start), <1 -> concave
+        return progress**aggression
+
+
+# ---------------------------------------------------------------------------
+# Weighted Least Connections (WLC) — tracks weighted in-flight load
+# ---------------------------------------------------------------------------
+
+
+class WeightedConnections:
+    """
+    Tracks weighted in-flight connections per instance.
+
+    Weight = prompt_tokens + max_tokens for each request.
+    Decay proportional to num_running drops.
+    """
+
+    def __init__(self) -> None:
+        # instance_id -> sum of weights of in-flight requests
+        self._weights: Dict[int, int] = {}
+        # instance_id -> num_running at last update
+        self._last_running: Dict[int, int] = {}
+
+    def add(self, instance_id: int, weight: int) -> None:
+        self._weights[instance_id] = self._weights.get(instance_id, 0) + weight
+
+    def decay(self, instance_id: int, current_running: float) -> None:
+        prev = self._last_running.get(instance_id)
+        if prev is None:
+            self._last_running[instance_id] = int(current_running)
+            return
+
+        if current_running == 0:
+            self._weights[instance_id] = 0
+        elif prev > 0 and current_running < prev:
+            ratio = current_running / prev
+            self._weights[instance_id] = int(self._weights.get(instance_id, 0) * ratio)
+
+        self._last_running[instance_id] = int(current_running)
+
+    def get(self, instance_id: int) -> int:
+        return self._weights.get(instance_id, 0)
+
+    def clear(self, instance_id: int) -> None:
+        self._weights.pop(instance_id, None)
+        self._last_running.pop(instance_id, None)
+
+
+# ---------------------------------------------------------------------------
 # Smart Strategy
 # ---------------------------------------------------------------------------
 
 
 class SmartLoadBalancingStrategy(LoadBalancingStrategy):
     """
-    Стратегия с admission control, request classification,
-    health-aware affinity и cooldown/hysteresis.
+    Smart load balancing using standard algorithms:
+
+    - Power of Two Choices (PoT) for load-aware selection
+    - Consistent Hashing with Bounded Loads (CHWBL) for prefix affinity
+    - Peak EWMA for KV cache smoothing (replaces cooldown/hysteresis)
+    - Circuit Breaker for overload protection (replaces burst + headroom)
+    - Weighted Least Connections for request-size awareness
+    - Slow Start for warm-up after idle periods
+    - Admission Control with request classification (short/medium/heavy)
+    - Session affinity via X-Session-Id
     """
 
     def __init__(self) -> None:
-        # session_key / prefix_key -> instance_id
-        self._affinity: Dict[str, int] = {}
-        # instance_id -> monotonic timestamp до которого инстанс "горячий"
-        self._hot_until: Dict[int, float] = {}
-        # instance_id -> monotonic timestamp последней активности
-        self._last_activity: Dict[int, float] = {}
-        # instance_id -> сумма total_expected_tokens по всем running запросам
-        self._inflight_tokens: Dict[int, int] = {}
-        # instance_id -> num_running на момент последнего select_instance
-        # используется для decay inflight_tokens
-        self._last_running_count: Dict[int, int] = {}
-        # Burst mode state
-        self._burst_active: bool = False
-        self._burst_until: float = 0.0
-        # Adaptive headroom multiplier
-        self._headroom_multiplier: float = 1.0
-        self._last_headroom_update: float = 0.0
+        # session_key -> instance_id
+        self._session_affinity: Dict[str, int] = {}
+        # Sub-components
+        self._ewma = PeakEWMA()
+        self._hash_ring = ConsistentHashRing(envs.LB_CHWBL_VNODES)
+        self._circuit_breaker = CircuitBreaker()
+        self._slow_start = SlowStart()
+        self._wlc = WeightedConnections()
         self._lock = asyncio.Lock()
 
     async def select_instance(
         self,
         instances: List[ModelInstance],
         profile: RequestProfile,
-    ) -> ModelInstance:  # noqa: C901, R0914
+    ) -> ModelInstance:
         if not instances:
             raise RuntimeError("No running instances available")
 
@@ -152,12 +446,29 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
 
         req_class = classify_request(profile.prompt_tokens, profile.max_tokens)
         now = time.monotonic()
+        instance_ids = [inst.id for inst in instances]
 
-        # 0) Обновить headroom multiplier и burst mode
-        self._update_headroom(instances, now)
-        self._update_burst_mode(instances, now)
+        # Update EWMA and WLC decay for all instances
+        for inst in instances:
+            m = get_metrics(inst.id)
+            self._ewma.update(inst.id, m.kv_cache_usage)
+            self._wlc.decay(inst.id, m.num_running)
 
-        # Лог: классификация запроса
+            # Update circuit breaker: trip if EWMA exceeds threshold
+            ewma_val = self._ewma.get(inst.id)
+            if ewma_val >= envs.LB_CIRCUIT_BREAKER_KV_THRESHOLD:
+                self._circuit_breaker.trip(inst.id, now)
+
+            # Update slow start: mark idle if clean, active otherwise
+            if m.num_running == 0 and m.num_waiting == 0 and m.kv_cache_usage < 0.25:
+                self._slow_start.mark_idle(inst.id, now)
+            else:
+                self._slow_start.mark_active(inst.id)
+
+        # Update hash ring with current instances
+        self._sync_hash_ring(instance_ids)
+
+        # Log: request classification
         logger.debug(
             "[smart_lb] classify prompt=%d max=%d total=%d -> class=%s "
             "session_key=%s prefix_key=%s",
@@ -169,69 +480,66 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             profile.prefix_key,
         )
 
-        # Лог: метрики всех инстансов
+        # Log: instance metrics
         for inst in instances:
             m = get_metrics(inst.id)
-            idle_s = now - self._last_activity.get(inst.id, now)
+            ewma_val = self._ewma.get(inst.id)
             logger.debug(
-                "[smart_lb] inst=%d running=%.0f waiting=%.0f kv=%.3f idle=%.1fs "
-                "stale=%s",
+                "[smart_lb] inst=%d running=%.0f waiting=%.0f kv=%.3f "
+                "ewma=%.3f cb=%s wlc=%d slow_start=%.2f stale=%s",
                 inst.id,
                 m.num_running,
                 m.num_waiting,
                 m.kv_cache_usage,
-                idle_s,
+                ewma_val,
+                self._circuit_breaker._get_state(inst.id),
+                self._wlc.get(inst.id),
+                self._slow_start.get_weight(inst.id, now),
                 m.is_stale(),
             )
 
-        # 1) Health-aware affinity (soft: помечаем pinned, но не возвращаем сразу)
-        pinned = self._get_affinity_candidate(instances, profile, req_class, now)
-        pinned_id: Optional[int] = pinned.id if pinned else None
-        if pinned is not None:
-            m = get_metrics(pinned.id)
-            logger.debug(
-                "[smart_lb] affinity hit inst=%d (running=%.0f waiting=%.0f kv=%.3f)",
-                pinned.id,
-                m.num_running,
-                m.num_waiting,
-                m.kv_cache_usage,
-            )
+        # 1) Check session affinity first (hard pin if healthy)
+        session_pinned = self._check_session_affinity(
+            instances, profile, req_class, now
+        )
+        if session_pinned is not None:
+            await self._finalize_selection(session_pinned, profile, now)
+            self._log_selection(session_pinned, req_class, profile, "session_affinity")
+            return session_pinned
 
-        # 2) Admission control: разделить на admissible и fallback
+        # 2) Check CHWBL prefix affinity (soft: only if not overloaded)
+        prefix_pinned = self._check_prefix_affinity(instances, profile, now)
+        prefix_pinned_id: Optional[int] = prefix_pinned.id if prefix_pinned else None
+
+        if prefix_pinned is not None:
+            m = get_metrics(prefix_pinned.id)
+            if self._admissible(m, req_class):
+                cb_state = self._circuit_breaker._get_state(prefix_pinned.id)
+                if cb_state != "OPEN":
+                    logger.debug(
+                        "[smart_lb] prefix affinity hit inst=%d "
+                        "(running=%.0f waiting=%.0f kv=%.3f)",
+                        prefix_pinned.id,
+                        m.num_running,
+                        m.num_waiting,
+                        m.kv_cache_usage,
+                    )
+
+        # 3) Admission control: split into admissible and fallback pools
         admissible: List[Tuple[ModelInstance, InstanceMetrics]] = []
         fallback: List[Tuple[ModelInstance, InstanceMetrics, str]] = []
 
         for inst in instances:
             m = get_metrics(inst.id)
 
-            # Обновить last_activity: если реплика занята — считать её активной
-            if m.num_running > 0 or m.num_waiting > 0:
-                self._last_activity[inst.id] = now
-
-            # Decay inflight tokens когда num_running упал
-            self._decay_inflight_tokens(inst.id, m.num_running)
-
-            if self._is_hot(inst.id, m.kv_cache_usage, now):
-                logger.debug(
-                    "[smart_lb] inst=%d excluded (hot, kv=%.3f >= %.2f)",
-                    inst.id,
-                    m.kv_cache_usage,
-                    _COOLDOWN_KV_HIGH,
-                )
-                fallback.append((inst, m, "hot"))
+            # Circuit breaker check
+            if not self._circuit_breaker.should_allow(inst.id, now):
+                fallback.append((inst, m, "circuit_open"))
                 continue
 
             if self._admissible(m, req_class):
                 admissible.append((inst, m))
-            elif inst.id == pinned_id and self._affinity_allowed(m, req_class):
-                # Soft affinity: pinned инстанс не прошёл admission, но проходит
-                # более мягкие пороги affinity — добавляем в fallback с пометкой
-                logger.debug(
-                    "[smart_lb] inst=%d affinity-fallback for %s "
-                    "(inadmissible but affinity_allowed)",
-                    inst.id,
-                    req_class,
-                )
+            elif inst.id == prefix_pinned_id and self._affinity_allowed(m, req_class):
                 fallback.append((inst, m, "affinity_fallback"))
             else:
                 lim = LIMITS[req_class]
@@ -258,7 +566,7 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             [f[0].id for f in fallback],
         )
 
-        # 3) Выбрать из admissible; если пусто — soft fallback
+        # 4) Build selection pool
         pool = (
             admissible if admissible else self._soft_fallback_pool(fallback, req_class)
         )
@@ -269,79 +577,49 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                 len(pool),
             )
 
-        best: Optional[ModelInstance] = None
-        best_score = math.inf
-        best_reason = "score"
-
-        for inst, m in pool:
-            affinity_bonus = self._affinity_bonus(inst.id, profile)
-            idle_bonus = self._idle_bonus(inst.id, m, req_class, now)
-
-            # Soft affinity: pinned инстанс получает дополнительный rebalance бонус.
-            # Это удерживает сессию на одной реплике при умеренной нагрузке,
-            # но позволяет idle-реплике перебить affinity при большом дисбалансе.
-            rebalance_bonus = 0.0
-            if inst.id == pinned_id:
-                rebalance_bonus = envs.LB_SOFT_AFFINITY_REBALANCE_BONUS
-
-            # Idle bonus не перебивает affinity: ограничить до 75% от affinity bonus
-            if affinity_bonus > 0:
-                idle_bonus = min(idle_bonus, affinity_bonus * 0.75)
-            s = self._score(
-                inst.id, m, req_class, affinity_bonus + rebalance_bonus, idle_bonus
-            )
-
-            logger.debug(
-                "[smart_lb] score inst=%d final=%.2f "
-                "(raw=%.2f affinity_bonus=%.2f rebalance_bonus=%.2f idle_bonus=%.2f)",
-                inst.id,
-                s,
-                s + affinity_bonus + rebalance_bonus + idle_bonus,
-                affinity_bonus,
-                rebalance_bonus,
-                idle_bonus,
-            )
-
-            if s < best_score:
-                best = inst
-                best_score = s
-                if inst.id == pinned_id:
-                    best_reason = "affinity"
-                elif inst in [a[0] for a in admissible]:
-                    best_reason = "admissible"
-                else:
-                    best_reason = "fallback"
+        # 5) Power of Two Choices selection
+        best = self._pot_select(pool, prefix_pinned_id, req_class, now)
 
         if best is None:
             raise RuntimeError("No suitable instance after admission control")
 
-        # 4) Зафиксировать affinity и активность
-        await self._bind_affinity(best.id, profile, now)
+        # 6) Finalize: bind affinity, update state
+        await self._finalize_selection(best, profile, now)
 
         m = get_metrics(best.id)
-        self._log_selection(best, req_class, profile, m, best_score, best_reason)
+        reason = "prefix_affinity" if best.id == prefix_pinned_id else "pot"
+        self._log_selection(best, req_class, profile, reason)
         return best
+
+    # ---- hash ring sync ----
+
+    def _sync_hash_ring(self, instance_ids: List[int]) -> None:
+        """Add/remove instances from the consistent hash ring."""
+        current_ids = set(self._hash_ring._hash_map.keys())
+        new_ids = set(instance_ids)
+
+        for rid in current_ids - new_ids:
+            self._hash_ring.remove(rid)
+        for aid in new_ids:
+            self._hash_ring.add(aid)
 
     # ---- admission ----
 
     def _admissible(self, m: InstanceMetrics, req_class: str) -> bool:
         lim = LIMITS[req_class]
-
-        # Применить headroom multiplier к KV-порогу
-        max_kv = lim.max_kv * self._headroom_multiplier
-
-        # Применить burst mode для short-запросов
-        if self._burst_active and req_class == "short":
-            max_kv = max_kv * envs.LB_BURST_KV_MULTIPLIER
-            max_running = lim.max_running + envs.LB_BURST_EXTRA_RUNNING
-        else:
-            max_running = lim.max_running
-
         return (
-            m.num_running <= max_running
+            m.num_running <= lim.max_running
             and m.num_waiting <= lim.max_waiting
-            and m.kv_cache_usage <= max_kv
+            and m.kv_cache_usage <= lim.max_kv
         )
+
+    def _affinity_allowed(self, m: InstanceMetrics, req_class: str) -> bool:
+        """Softer thresholds for affinity fallback."""
+        if req_class == "heavy":
+            return m.num_running == 0 and m.num_waiting == 0 and m.kv_cache_usage < 0.40
+        if req_class == "medium":
+            return m.num_running < 3 and m.num_waiting <= 1 and m.kv_cache_usage < 0.55
+        return m.kv_cache_usage < 0.90
 
     def _soft_fallback_pool(
         self,
@@ -350,13 +628,16 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
     ) -> List[Tuple[ModelInstance, InstanceMetrics]]:
         ranked: List[Tuple[ModelInstance, InstanceMetrics]] = []
         for inst, m, reason in fallback:
-            # affinity_fallback уже прошёл _affinity_allowed — пропускаем без проверок
+            # affinity_fallback already passed _affinity_allowed
             if reason == "affinity_fallback":
                 ranked.append((inst, m))
                 continue
 
+            # circuit_open instances — still include as last resort
+            if reason == "circuit_open":
+                continue
+
             if req_class == "heavy":
-                # Fallback: чуть выше admission, но не выше 0.60
                 if (
                     m.num_waiting == 0
                     and m.kv_cache_usage < 0.60
@@ -364,241 +645,188 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                 ):
                     ranked.append((inst, m))
             elif req_class == "medium":
-                # Fallback: чуть выше admission (0.60 -> 0.75)
                 if m.num_waiting <= 1 and m.kv_cache_usage < 0.75:
                     ranked.append((inst, m))
             else:
-                # short — принимаем всё
+                # short — accept all
                 ranked.append((inst, m))
         return ranked
 
-    # ---- scoring ----
+    # ---- session affinity ----
 
-    def _score(
-        self,
-        instance_id: int,
-        m: InstanceMetrics,
-        req_class: str,
-        affinity_bonus: float,
-        idle_bonus: float,
-    ) -> float:
-        score = (
-            envs.LB_WEIGHT_RUNNING * m.num_running
-            + envs.LB_WEIGHT_WAITING * m.num_waiting
-            + envs.LB_WEIGHT_KV * m.kv_cache_usage
-        )
-
-        if req_class == "medium":
-            score += (
-                envs.LB_MEDIUM_EXTRA_RUNNING * m.num_running
-                + envs.LB_MEDIUM_EXTRA_KV * m.kv_cache_usage
-            )
-        elif req_class == "heavy":
-            score += (
-                envs.LB_HEAVY_EXTRA_RUNNING * m.num_running
-                + envs.LB_HEAVY_EXTRA_KV * m.kv_cache_usage
-            )
-
-        # In-flight tokens penalty
-        inflight = self._inflight_tokens.get(instance_id, 0)
-        score += envs.LB_WEIGHT_INFLIGHT_TOKENS * inflight
-
-        return score - affinity_bonus - idle_bonus
-
-    def _affinity_bonus(self, instance_id: int, profile: RequestProfile) -> float:
-        bonus = 0.0
-        if (
-            profile.session_key
-            and self._affinity.get(profile.session_key) == instance_id
-        ):
-            bonus += envs.LB_AFFINITY_SESSION_BONUS
-        if profile.prefix_key and self._affinity.get(profile.prefix_key) == instance_id:
-            bonus += envs.LB_AFFINITY_PREFIX_BONUS
-        return bonus
-
-    # ---- idle bonus ----
-
-    def _idle_bonus(
-        self, instance_id: int, m: InstanceMetrics, req_class: str, now: float
-    ) -> float:
-        """
-        Вычислить idle bonus для реплики.
-
-        Применяется только если реплика "чистая" (running=0, waiting=0, kv<0.25).
-        Инициализация last_activity — с now (не с 0), чтобы избежать ложного бонуса
-        после рестарта балансера.
-        """
-        # Инициализировать с now, если впервые видим эту реплику
-        last = self._last_activity.setdefault(instance_id, now)
-        idle_seconds = now - last
-
-        if idle_seconds < _IDLE_THRESHOLD:
-            return 0.0
-
-        # Только для "чистых" реплик
-        if not (
-            m.num_running == 0
-            and m.num_waiting == 0
-            and m.kv_cache_usage < _IDLE_KV_THRESHOLD
-        ):
-            return 0.0
-
-        # Вычислить базовый бонус
-        bonus = idle_seconds * _IDLE_PER_SEC
-
-        # Ограничить по классу запроса
-        if req_class == "heavy":
-            bonus = min(bonus, _IDLE_MAX_HEAVY)
-        elif req_class == "medium":
-            bonus = min(bonus, _IDLE_MAX_MEDIUM)
-        else:
-            bonus = min(bonus, _IDLE_MAX_SHORT)
-
-        return bonus
-
-    # ---- affinity ----
-
-    def _get_affinity_candidate(
+    def _check_session_affinity(
         self,
         instances: List[ModelInstance],
         profile: RequestProfile,
         req_class: str,
         now: float,
     ) -> Optional[ModelInstance]:
-        keys = [k for k in [profile.session_key, profile.prefix_key] if k]
-        if not keys:
+        """Check session affinity — hard pin if the pinned instance is healthy."""
+        if not profile.session_key:
             return None
 
-        ids = {inst.id: inst for inst in instances}
-        for key in keys:
-            pinned_id = self._affinity.get(key)
-            if not pinned_id or pinned_id not in ids:
-                continue
+        pinned_id = self._session_affinity.get(profile.session_key)
+        if pinned_id is None:
+            return None
 
-            inst = ids[pinned_id]
-            m = get_metrics(inst.id)
+        ids_map = {inst.id: inst for inst in instances}
+        if pinned_id not in ids_map:
+            return None
 
-            if self._is_hot(inst.id, m.kv_cache_usage, now):
-                continue
-            if self._affinity_allowed(m, req_class):
-                return inst
+        inst = ids_map[pinned_id]
 
-        return None
+        # Session affinity is hard: only release if circuit is OPEN
+        if self._circuit_breaker._get_state(inst.id) == "OPEN":
+            return None
 
-    def _affinity_allowed(self, m: InstanceMetrics, req_class: str) -> bool:
+        return inst
+
+    # ---- prefix affinity (CHWBL) ----
+
+    def _check_prefix_affinity(
+        self,
+        instances: List[ModelInstance],
+        profile: RequestProfile,
+        now: float,
+    ) -> Optional[ModelInstance]:
+        """Check CHWBL prefix affinity — soft pin, respects load bounds."""
+        if not profile.prefix_key:
+            return None
+
+        if self._hash_ring.is_empty:
+            return None
+
+        instance_ids = [inst.id for inst in instances]
+
+        def is_overloaded(inst_id: int) -> bool:
+            ewma_val = self._ewma.get(inst_id)
+            # Overloaded if EWMA KV is high or circuit is OPEN
+            if self._circuit_breaker._get_state(inst_id) == "OPEN":
+                return True
+            return ewma_val > 0.70
+
+        pinned_id = self._hash_ring.get(profile.prefix_key, instance_ids, is_overloaded)
+
+        if pinned_id is None:
+            return None
+
+        ids_map = {inst.id: inst for inst in instances}
+        return ids_map.get(pinned_id)
+
+    # ---- PoT scoring ----
+
+    def _pot_score(
+        self,
+        inst_id: int,
+        m: InstanceMetrics,
+        req_class: str,
+        is_pinned: bool,
+        now: float,
+    ) -> float:
+        """
+        Power of Two Choices score.
+
+        score = running + waiting + alpha * ewma_kv + wlc_penalty
+                - affinity_bonus - slow_start_bonus
+
+        Lower is better.
+        """
+        ewma_kv = self._ewma.get(inst_id)
+        wlc_weight = self._wlc.get(inst_id)
+
+        # Base score
+        score = m.num_running + m.num_waiting + envs.LB_POT_ALPHA * ewma_kv
+
+        # WLC penalty (scaled to be comparable)
+        score += wlc_weight * 0.0001
+
+        # Class extras: heavy/medium get extra penalty on loaded replicas
         if req_class == "heavy":
-            return m.num_running == 0 and m.num_waiting == 0 and m.kv_cache_usage < 0.40
-        if req_class == "medium":
-            return m.num_running < 3 and m.num_waiting <= 1 and m.kv_cache_usage < 0.55
-        return m.kv_cache_usage < 0.90
+            score += m.num_running * 2.0 + ewma_kv * 3.0
+        elif req_class == "medium":
+            score += m.num_running * 1.0 + ewma_kv * 1.5
 
-    # ---- cooldown / hysteresis ----
+        # Affinity bonus (reduces score)
+        if is_pinned:
+            score -= envs.LB_AFFINITY_SESSION_BONUS
 
-    def _is_hot(self, instance_id: int, kv_usage: float, now: float) -> bool:
-        hot_until = self._hot_until.get(instance_id)
-        if kv_usage >= _COOLDOWN_KV_HIGH:
-            self._hot_until[instance_id] = now + _COOLDOWN_DURATION
-            return True
-        if hot_until and now < hot_until:
-            return kv_usage > _COOLDOWN_KV_LOW
-        return False
+        # Slow start bonus: idle instances get lower score
+        ss_weight = self._slow_start.get_weight(inst_id, now)
+        if ss_weight > 0:
+            score -= ss_weight * 2.0
 
-    # ---- inflight tokens decay ----
+        return score
 
-    def _decay_inflight_tokens(self, instance_id: int, current_running: float) -> None:
+    def _pot_select(
+        self,
+        pool: List[Tuple[ModelInstance, InstanceMetrics]],
+        prefix_pinned_id: Optional[int],
+        req_class: str,
+        now: float,
+    ) -> Optional[ModelInstance]:
         """
-        Когда num_running упал, пропорционально уменьшить inflight_tokens.
-        Если num_running стал 0, сбросить полностью.
+        Power of Two Choices: pick 2 random candidates, return the one
+        with the lower score.
         """
-        prev = self._last_running_count.get(instance_id)
-        if prev is None:
-            self._last_running_count[instance_id] = int(current_running)
-            return
+        if not pool:
+            return None
 
-        if current_running == 0:
-            self._inflight_tokens[instance_id] = 0
-        elif prev > 0 and current_running < prev:
-            # Пропорционально уменьшить: сохраним (current / prev) от текущего значения
-            ratio = current_running / prev
-            self._inflight_tokens[instance_id] = int(
-                self._inflight_tokens.get(instance_id, 0) * ratio
+        if len(pool) == 1:
+            return pool[0][0]
+
+        # Pick 2 random candidates
+        candidates = random.sample(pool, 2)
+
+        best = None
+        best_score = math.inf
+
+        for inst, m in candidates:
+            is_pinned = inst.id == prefix_pinned_id
+            s = self._pot_score(inst.id, m, req_class, is_pinned, now)
+
+            logger.debug(
+                "[smart_lb] pot score inst=%d final=%.2f "
+                "(running=%.0f waiting=%.0f ewma_kv=%.3f wlc=%d "
+                "pinned=%s slow_start=%.2f)",
+                inst.id,
+                s,
+                m.num_running,
+                m.num_waiting,
+                self._ewma.get(inst.id),
+                self._wlc.get(inst.id),
+                is_pinned,
+                self._slow_start.get_weight(inst.id, now),
             )
 
-        self._last_running_count[instance_id] = int(current_running)
+            if s < best_score:
+                best = inst
+                best_score = s
 
-    # ---- burst mode ----
+        return best
 
-    def _update_burst_mode(self, instances: List[ModelInstance], now: float) -> None:
-        """
-        Включить burst mode когда все инстансы имеют waiting > 0.
-        Выключить когда таймер истёк.
-        """
-        all_waiting = all(get_metrics(inst.id).num_waiting > 0 for inst in instances)
+    # ---- finalize ----
 
-        if all_waiting and not self._burst_active:
-            self._burst_active = True
-            self._burst_until = now + envs.LB_BURST_DURATION
-            logger.info(
-                "[smart_lb] burst mode ENABLED for %.1fs", envs.LB_BURST_DURATION
-            )
-        elif self._burst_active and now >= self._burst_until:
-            self._burst_active = False
-            logger.info("[smart_lb] burst mode DISABLED (timer expired)")
-        elif not all_waiting and self._burst_active:
-            # Если не все waiting, но burst ещё активен — дождаться таймера
-            pass
-
-    # ---- adaptive headroom multiplier ----
-
-    def _update_headroom(self, instances: List[ModelInstance], now: float) -> None:
-        """
-        Обновить headroom multiplier не чаще чем раз в LB_HEADROOM_INTERVAL.
-        """
-        if now - self._last_headroom_update < envs.LB_HEADROOM_INTERVAL:
-            return
-
-        self._last_headroom_update = now
-
-        all_metrics = [get_metrics(inst.id) for inst in instances]
-        avg_kv = sum(m.kv_cache_usage for m in all_metrics) / len(all_metrics)
-        all_waiting = all(m.num_waiting > 0 for m in all_metrics)
-
-        if all_waiting:
-            new_multiplier = max(self._headroom_multiplier, envs.LB_HEADROOM_MAX)
-        elif avg_kv < envs.LB_HEADROOM_LOW_KV:
-            new_multiplier = min(self._headroom_multiplier, envs.LB_HEADROOM_MIN)
-        else:
-            new_multiplier = 1.0
-
-        if abs(new_multiplier - self._headroom_multiplier) > 0.001:
-            logger.info(
-                "[smart_lb] headroom multiplier %.2f -> %.2f (avg_kv=%.3f all_waiting=%s)",
-                self._headroom_multiplier,
-                new_multiplier,
-                avg_kv,
-                all_waiting,
-            )
-            self._headroom_multiplier = new_multiplier
-
-    async def _bind_affinity(
-        self, instance_id: int, profile: RequestProfile, now: float
+    async def _finalize_selection(
+        self, inst: ModelInstance, profile: RequestProfile, now: float
     ) -> None:
+        """Update state after selecting an instance."""
         async with self._lock:
+            # Bind session affinity
             if profile.session_key:
-                self._affinity[profile.session_key] = instance_id
-            if profile.prefix_key:
-                self._affinity[profile.prefix_key] = instance_id
-            # Зафиксировать активность выбранной реплики
-            self._last_activity[instance_id] = now
-            # Зафиксировать inflight tokens
-            self._inflight_tokens[instance_id] = (
-                self._inflight_tokens.get(instance_id, 0)
-                + profile.total_expected_tokens
-            )
+                self._session_affinity[profile.session_key] = inst.id
+
+            # Add WLC weight
+            self._wlc.add(inst.id, profile.total_expected_tokens)
+
+            # Mark active for slow start
+            self._slow_start.mark_active(inst.id)
+
+            # Record circuit breaker success
+            self._circuit_breaker.record_success(inst.id, now)
 
     async def clear_affinity(self, session_key: str) -> None:
         async with self._lock:
-            self._affinity.pop(session_key, None)
+            self._session_affinity.pop(session_key, None)
 
     # ---- logging ----
 
@@ -607,15 +835,14 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
         inst: ModelInstance,
         req_class: str,
         profile: RequestProfile,
-        m: InstanceMetrics,
-        score: float,
         reason: str,
     ) -> None:
-        inflight = self._inflight_tokens.get(inst.id, 0)
+        m = get_metrics(inst.id)
+        ewma_val = self._ewma.get(inst.id)
         logger.info(
             "[smart_lb] >>> SELECTED inst=%d class=%s prompt=%d max=%d "
-            "running=%.0f waiting=%.0f kv=%.3f score=%.2f reason=%s "
-            "inflight=%d burst=%s headroom=%.2f "
+            "running=%.0f waiting=%.0f kv=%.3f ewma=%.3f reason=%s "
+            "wlc=%d cb=%s slow_start=%.2f "
             "session_key=%s prefix_key=%s",
             inst.id,
             req_class,
@@ -624,11 +851,11 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             m.num_running,
             m.num_waiting,
             m.kv_cache_usage,
-            score,
+            ewma_val,
             reason,
-            inflight,
-            self._burst_active,
-            self._headroom_multiplier,
+            self._wlc.get(inst.id),
+            self._circuit_breaker._get_state(inst.id),
+            self._slow_start.get_weight(inst.id, time.monotonic()),
             profile.session_key,
             profile.prefix_key,
         )

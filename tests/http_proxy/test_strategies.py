@@ -1,5 +1,6 @@
-"""Tests for SmartLoadBalancingStrategy: classification, admission control,
-affinity, cooldown, scoring, inflight tokens, burst mode, and headroom."""
+"""Tests for SmartLoadBalancingStrategy and sub-components:
+PeakEWMA, ConsistentHashRing, CircuitBreaker, SlowStart, WeightedConnections,
+PoT scoring, admission control, affinity, and classification."""
 
 import time
 from unittest.mock import MagicMock, patch
@@ -8,9 +9,14 @@ import pytest
 
 from gpustack.http_proxy.instance_metrics_cache import InstanceMetrics
 from gpustack.http_proxy.strategies import (
+    CircuitBreaker,
     classify_request,
+    ConsistentHashRing,
+    PeakEWMA,
     RequestProfile,
     SmartLoadBalancingStrategy,
+    SlowStart,
+    WeightedConnections,
 )
 
 
@@ -59,6 +65,271 @@ class TestClassifyRequest:
 
     def test_boundary_medium(self):
         assert classify_request(47_999, 8_000) == "medium"
+
+
+# ---------------------------------------------------------------------------
+# RequestProfile
+# ---------------------------------------------------------------------------
+
+
+class TestRequestProfile:
+    def test_total_expected_tokens(self):
+        p = RequestProfile(prompt_tokens=1000, max_tokens=500)
+        assert p.total_expected_tokens == 1500
+
+    def test_defaults_to_zero(self):
+        p = RequestProfile()
+        assert p.total_expected_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# PeakEWMA
+# ---------------------------------------------------------------------------
+
+
+class TestPeakEWMA:
+    def test_initial_value(self):
+        ewma = PeakEWMA()
+        val = ewma.update(1, 0.5)
+        assert val == 0.5
+        assert ewma.get(1) == 0.5
+
+    def test_rising_load_fast_reaction(self):
+        ewma = PeakEWMA()
+        ewma.update(1, 0.3)
+        # Rise to 0.8 — alpha_rise=0.7, so ewma = 0.7*0.8 + 0.3*0.3 = 0.65
+        val = ewma.update(1, 0.8)
+        assert val == pytest.approx(0.65, abs=0.01)
+
+    def test_falling_load_slow_decay(self):
+        ewma = PeakEWMA()
+        ewma.update(1, 0.8)
+        # Fall to 0.2 — alpha_fall=0.3, so ewma = 0.3*0.2 + 0.7*0.8 = 0.62
+        val = ewma.update(1, 0.2)
+        assert val == pytest.approx(0.62, abs=0.01)
+
+    def test_unknown_instance_returns_zero(self):
+        ewma = PeakEWMA()
+        assert ewma.get(999) == 0.0
+
+    def test_clear(self):
+        ewma = PeakEWMA()
+        ewma.update(1, 0.5)
+        ewma.clear(1)
+        assert ewma.get(1) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# ConsistentHashRing
+# ---------------------------------------------------------------------------
+
+
+class TestConsistentHashRing:
+    def test_basic_lookup(self):
+        ring = ConsistentHashRing(vnodes=50)
+        ring.add(1)
+        ring.add(2)
+
+        # Same key should map to same instance
+        result1 = ring.get("key:abc", [1, 2], lambda x: False)
+        result2 = ring.get("key:abc", [1, 2], lambda x: False)
+        assert result1 == result2
+        assert result1 in (1, 2)
+
+    def test_different_keys_different_instances(self):
+        ring = ConsistentHashRing(vnodes=50)
+        ring.add(1)
+        ring.add(2)
+
+        r1 = ring.get("key:a", [1, 2], lambda x: False)
+        r2 = ring.get("key:b", [1, 2], lambda x: False)
+        # Keys are different; instances may or may not differ, but both valid
+        assert r1 in (1, 2)
+        assert r2 in (1, 2)
+
+    def test_skips_overloaded_instance(self):
+        ring = ConsistentHashRing(vnodes=50)
+        ring.add(1)
+        ring.add(2)
+
+        # Instance 1 is overloaded
+        def is_overloaded(x):
+            return x == 1
+
+        result = ring.get("key:abc", [1, 2], is_overloaded)
+        assert result == 2
+
+    def test_returns_none_when_all_overloaded(self):
+        ring = ConsistentHashRing(vnodes=50)
+        ring.add(1)
+        ring.add(2)
+
+        result = ring.get("key:abc", [1, 2], lambda x: True)
+        assert result is None
+
+    def test_removes_instance(self):
+        ring = ConsistentHashRing(vnodes=50)
+        ring.add(1)
+        ring.add(2)
+        ring.remove(1)
+
+        result = ring.get("key:abc", [2], lambda x: False)
+        assert result == 2
+
+    def test_empty_ring(self):
+        ring = ConsistentHashRing(vnodes=50)
+        assert ring.is_empty is True
+        ring.add(1)
+        assert ring.is_empty is False
+
+
+# ---------------------------------------------------------------------------
+# CircuitBreaker
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreaker:
+    def test_initially_closed(self):
+        cb = CircuitBreaker()
+        assert cb.should_allow(1, time.monotonic()) is True
+
+    def test_trip_opens_circuit(self):
+        cb = CircuitBreaker()
+        now = time.monotonic()
+        cb.trip(1, now)
+        assert cb.should_allow(1, now + 1) is False
+
+    def test_half_open_after_timeout(self):
+        cb = CircuitBreaker()
+        now = time.monotonic()
+        cb.trip(1, now)
+
+        # After timeout, should transition to HALF-OPEN and allow
+        with patch("gpustack.http_proxy.strategies.envs") as mock_envs:
+            mock_envs.LB_CIRCUIT_BREAKER_TIMEOUT = 2.0
+            assert cb.should_allow(1, now + 3.0) is True
+            assert cb._get_state(1) == "HALF-OPEN"
+
+    def test_success_closes_circuit(self):
+        cb = CircuitBreaker()
+        now = time.monotonic()
+        cb.trip(1, now)
+        cb.record_success(1, now + 1)
+        assert cb._get_state(1) == "CLOSED"
+        assert cb.should_allow(1, now + 1) is True
+
+    def test_failure_from_half_open_goes_back_to_open(self):
+        cb = CircuitBreaker()
+        now = time.monotonic()
+        cb.trip(1, now)
+
+        with patch("gpustack.http_proxy.strategies.envs") as mock_envs:
+            mock_envs.LB_CIRCUIT_BREAKER_TIMEOUT = 2.0
+            cb.should_allow(1, now + 3.0)  # transitions to HALF-OPEN
+            cb.record_failure(1, now + 3.0)
+            assert cb._get_state(1) == "OPEN"
+
+    def test_clear(self):
+        cb = CircuitBreaker()
+        cb.trip(1, time.monotonic())
+        cb.clear(1)
+        assert cb._get_state(1) == "CLOSED"
+
+
+# ---------------------------------------------------------------------------
+# SlowStart
+# ---------------------------------------------------------------------------
+
+
+class TestSlowStart:
+    def test_active_instance_returns_zero(self):
+        ss = SlowStart()
+        ss.mark_active(1)
+        assert ss.get_weight(1, time.monotonic()) == 0.0
+
+    def test_idle_instance_ramps_up(self):
+        ss = SlowStart()
+        now = time.monotonic()
+        ss.mark_idle(1, now)
+
+        # Halfway through window (15s default)
+        weight = ss.get_weight(1, now + 7.5)
+        assert weight == pytest.approx(0.5, abs=0.05)
+
+    def test_fully_warmed_up(self):
+        ss = SlowStart()
+        now = time.monotonic()
+        ss.mark_idle(1, now)
+
+        # After full window
+        weight = ss.get_weight(1, now + 20.0)
+        assert weight == 1.0
+
+    def test_mark_active_stops_tracking(self):
+        ss = SlowStart()
+        now = time.monotonic()
+        ss.mark_idle(1, now)
+        ss.mark_active(1)
+        assert ss.get_weight(1, now + 20.0) == 0.0
+
+    def test_re_mark_idle_resets(self):
+        ss = SlowStart()
+        now = time.monotonic()
+        ss.mark_idle(1, now)
+        ss.mark_active(1)
+        ss.mark_idle(1, now + 10)
+
+        # Should start from 0 again
+        weight = ss.get_weight(1, now + 15)
+        assert weight == pytest.approx(0.33, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# WeightedConnections
+# ---------------------------------------------------------------------------
+
+
+class TestWeightedConnections:
+    def test_add_weight(self):
+        wc = WeightedConnections()
+        wc.add(1, 5000)
+        assert wc.get(1) == 5000
+
+    def test_accumulates(self):
+        wc = WeightedConnections()
+        wc.add(1, 3000)
+        wc.add(1, 2000)
+        assert wc.get(1) == 5000
+
+    def test_decay_on_running_drop(self):
+        wc = WeightedConnections()
+        wc.add(1, 10000)
+        wc._last_running[1] = 4
+
+        wc.decay(1, 2)  # dropped from 4 to 2
+        assert wc.get(1) == 5000
+
+    def test_zero_running_clears(self):
+        wc = WeightedConnections()
+        wc.add(1, 10000)
+        wc._last_running[1] = 3
+
+        wc.decay(1, 0)
+        assert wc.get(1) == 0
+
+    def test_no_decay_when_running_same(self):
+        wc = WeightedConnections()
+        wc.add(1, 10000)
+        wc._last_running[1] = 2
+
+        wc.decay(1, 2)
+        assert wc.get(1) == 10000
+
+    def test_clear(self):
+        wc = WeightedConnections()
+        wc.add(1, 5000)
+        wc.clear(1)
+        assert wc.get(1) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +383,8 @@ class TestAdmissionControl:
             result = await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # inst2 has lower score, should be preferred
+            # PoT picks 2 random; both admissible. inst2 has lower score.
+            # With only 2 candidates, PoT picks both and returns best.
             assert result.id == 2
 
     @pytest.mark.asyncio
@@ -134,213 +406,65 @@ class TestAdmissionControl:
 
 
 # ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — cooldown / hysteresis
+# SmartLoadBalancingStrategy — session affinity
 # ---------------------------------------------------------------------------
 
 
-class TestCooldown:
+class TestSessionAffinity:
     @pytest.mark.asyncio
-    async def test_hot_instance_is_excluded(self):
-        strategy = SmartLoadBalancingStrategy()
-
-        # Mark inst1 as hot by calling _is_hot with high kv
-        metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.90),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
-        }
-        with _patch_metrics(metrics):
-            # First call: inst1 is hot (kv>=0.80), should pick inst2
-            profile = RequestProfile(prompt_tokens=100)
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile
-            )
-            assert result.id == 2
-
-    @pytest.mark.asyncio
-    async def test_cooldown_persists_until_cool(self):
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        # Trigger hot state on inst1
-        assert strategy._is_hot(1, 0.90, now) is True
-        # During cooldown, even if kv drops to 0.70 (> COOLDOWN_KV_LOW=0.65), still hot
-        assert strategy._is_hot(1, 0.70, now + 1.0) is True
-        # If kv drops below COOLDOWN_KV_LOW, not hot anymore
-        assert strategy._is_hot(1, 0.60, now + 1.0) is False
-
-
-# ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — affinity
-# ---------------------------------------------------------------------------
-
-
-class TestAffinity:
-    @pytest.mark.asyncio
-    async def test_session_affinity(self):
+    async def test_session_affinity_pins_instance(self):
         strategy = SmartLoadBalancingStrategy()
         metrics = {
             1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
             2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
-            # First request: no affinity yet, picks based on score (inst2 is lower)
             profile = RequestProfile(
                 prompt_tokens=100,
                 session_key="uid:42",
             )
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile
-            )
-            first_id = result.id
-
-            # Second request: affinity should pin to first_id
-            result2 = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile
-            )
-            assert result2.id == first_id
-
-    @pytest.mark.asyncio
-    async def test_prefix_affinity(self):
-        strategy = SmartLoadBalancingStrategy()
-        metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
-        }
-        with _patch_metrics(metrics):
-            profile = RequestProfile(
-                prompt_tokens=100,
-                prefix_key="prefix:abc123",
-            )
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile
-            )
-            first_id = result.id
-
-            result2 = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile
-            )
-            assert result2.id == first_id
-
-    @pytest.mark.asyncio
-    async def test_affinity_released_when_instance_gone(self):
-        strategy = SmartLoadBalancingStrategy()
-        metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
-        }
-        with _patch_metrics(metrics):
-            profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-            # First: bind to some instance
+            # First request: no affinity yet
             await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # Second: only inst1 available (inst2 removed)
-            result = await strategy.select_instance([_make_instance(1)], profile)
-            assert result.id == 1
+            first_id = strategy._session_affinity.get("uid:42")
+
+            # Second request: affinity pins to first_id
+            result2 = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile
+            )
+            assert result2.id == first_id
 
     @pytest.mark.asyncio
-    async def test_soft_affinity_allows_idle_replica_to_win(self):
-        """Soft affinity: idle реплика с большим idle-bonus перебивает pinned."""
+    async def test_session_affinity_released_when_circuit_open(self):
         strategy = SmartLoadBalancingStrategy()
         now = time.monotonic()
 
-        # Привязать сессию к inst1
+        # Bind session to inst1
         profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-        await strategy._bind_affinity(1, profile, now)
+        await strategy._finalize_selection(_make_instance(1), profile, now)
 
-        # inst1: pinned, умеренная нагрузка
-        # inst2: обычная нагрузка
-        # inst3: полностью idle, простаивает 20 сек
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now
-        strategy._last_activity[3] = now - 20
+        # Trip circuit breaker for inst1
+        strategy._circuit_breaker.trip(1, now)
 
         metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-            2: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-            3: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.05),
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
             result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2), _make_instance(3)],
-                profile,
+                [_make_instance(1), _make_instance(2)], profile
             )
-            # inst1: score = 5*1+12*0.3 - 4(affinity) - 2(rebalance) = 1.6
-            # inst2: score = 5*1+12*0.3 - 0 = 8.6
-            # inst3: score = 0+12*0.05 - 0 + 0 - idle_bonus(20*0.2=4, capped 3) = -2.7
-            # inst3 выигрывает за счёт idle-bonus
-            assert result.id == 3
-
-    @pytest.mark.asyncio
-    async def test_soft_affinity_pinned_wins_when_balanced(self):
-        """Soft affinity: pinned выигрывает когда все реплики имеют нагрузку."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-        await strategy._bind_affinity(1, profile, now)
-
-        # Все реплики имеют одинаковую умеренную нагрузку
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now
-        strategy._last_activity[3] = now
-
-        metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-            2: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-            3: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-        }
-        with _patch_metrics(metrics):
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2), _make_instance(3)],
-                profile,
-            )
-            # inst1: score = 5*1+12*0.3 - 4(affinity) - 2(rebalance) = 1.6
-            # inst2: score = 5*1+12*0.3 = 8.6
-            # inst3: score = 5*1+12*0.3 = 8.6
-            # inst1 выигрывает за счёт affinity + rebalance бонусов
-            assert result.id == 1
-
-    @pytest.mark.asyncio
-    async def test_soft_affinity_pinned_fallback_when_inadmissible(self):
-        """Pinned инстанс не прошёл admission, но попадает через affinity_fallback."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-        await strategy._bind_affinity(1, profile, now)
-
-        # inst1: pinned, но kv=0.6 > medium_max_kv(0.50) — inadmissible для admission
-        # Однако _affinity_allowed для medium: kv < 0.55 ... 0.6 > 0.55
-        # Значит affinity_allowed тоже False. Используем short, где порог 0.90.
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now
-
-        metrics = {
-            1: InstanceMetrics(num_running=2, num_waiting=0, kv_cache_usage=0.6),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-        }
-        with _patch_metrics(metrics):
-            # short: max_running=3, max_kv=0.85. inst1 admissible.
-            # medium: max_running=2, max_kv=0.50. inst1 inadmissible, affinity_allowed: kv<0.55 -> False
-            # Используем short, где inst1 проходит admission
-            short_profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)],
-                short_profile,
-            )
-            # inst1: score = 5*2+12*0.6 - 4(affinity) - 2(rebalance) = 6.2
-            # inst2: score = 0+12*0.1 = 1.2
-            # inst2 выигрывает (idle bonus не применяется, last_activity=now)
-            assert result.id == 2
+            # Session affinity released because circuit is OPEN
+            assert result.id != 1
 
 
 # ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — scoring
+# SmartLoadBalancingStrategy — scoring (PoT)
 # ---------------------------------------------------------------------------
 
 
-class TestScoring:
+class TestPoTScoring:
     @pytest.mark.asyncio
     async def test_lower_score_wins(self):
         strategy = SmartLoadBalancingStrategy()
@@ -358,7 +482,6 @@ class TestScoring:
     @pytest.mark.asyncio
     async def test_heavy_request_gets_higher_penalty_on_loaded_replica(self):
         strategy = SmartLoadBalancingStrategy()
-        # Both replicas have some load
         metrics = {
             1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.4),
             2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
@@ -370,231 +493,117 @@ class TestScoring:
             )
             assert result.id == 2
 
+
+# ---------------------------------------------------------------------------
+# SmartLoadBalancingStrategy — WLC affects scoring
+# ---------------------------------------------------------------------------
+
+
+class TestWLCScoring:
     @pytest.mark.asyncio
-    async def test_affinity_bonus_prefers_pinned_replica(self):
+    async def test_wlc_affects_score(self):
         strategy = SmartLoadBalancingStrategy()
+        strategy._wlc.add(1, 50000)
+        strategy._wlc.add(2, 0)
+
         metrics = {
             1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
-        }
-        with _patch_metrics(metrics):
-            # First request: bind session to inst1
-            profile1 = RequestProfile(
-                prompt_tokens=100,
-                session_key="uid:42",
-            )
-            # Manually set affinity
-            await strategy._bind_affinity(1, profile1, time.monotonic())
-
-            # Second request: inst2 has lower raw score, but affinity bonus for inst1
-            profile2 = RequestProfile(
-                prompt_tokens=100,
-                session_key="uid:42",
-            )
-            result = await strategy.select_instance(
-                [_make_instance(1), _make_instance(2)], profile2
-            )
-            # affinity_bonus=4.0 for session, inst1 score = 5*1+12*0.3-4.0 = 3.6
-            # inst2 score = 0+12*0.2-0 = 2.4
-            # inst2 still wins because its raw score is much lower
-            # This tests that bonus is applied, not that it always wins
-            assert result is not None
-
-
-# ---------------------------------------------------------------------------
-# RequestProfile
-# ---------------------------------------------------------------------------
-
-
-class TestRequestProfile:
-    def test_total_expected_tokens(self):
-        p = RequestProfile(prompt_tokens=1000, max_tokens=500)
-        assert p.total_expected_tokens == 1500
-
-    def test_defaults_to_zero(self):
-        p = RequestProfile()
-        assert p.total_expected_tokens == 0
-
-
-# ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — idle bonus
-# ---------------------------------------------------------------------------
-
-
-class TestIdleBonus:
-    @pytest.mark.asyncio
-    async def test_idle_bonus_prefers_idle_replica(self):
-        """Реплика, простаивающая 15 сек, получает приоритет над активной."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        # Инициализировать: inst1 активна сейчас, inst2 простаивает 15 сек
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now - 15
-
-        # Обе реплики "чистые"
-        metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
+            2: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3),
         }
         with _patch_metrics(metrics):
             profile = RequestProfile(prompt_tokens=100)
             result = await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # inst2 простаивает 15 сек, получает idle bonus, должна выиграть
+            # inst2 has lower WLC, should win
             assert result.id == 2
 
     @pytest.mark.asyncio
-    async def test_idle_bonus_capped_at_max(self):
-        """Бонус не превышает MAX даже при долгом простое."""
+    async def test_wlc_accumulated_on_selection(self):
         strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        # inst2 простаивает 600 сек (10 минут)
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now - 600
-
         metrics = {
             1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
             2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
         }
         with _patch_metrics(metrics):
-            # Проверить, что бонус capped
-            m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1)
-            bonus = strategy._idle_bonus(2, m, "short", now)
-            # 600 * 0.2 = 120, но max = 3.0
-            assert bonus == 3.0
-
-    @pytest.mark.asyncio
-    async def test_idle_bonus_reset_after_selection(self):
-        """После выбора реплики её last_activity обновляется."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        strategy._last_activity[1] = now - 20
-        strategy._last_activity[2] = now - 20
-
-        metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-        }
-        with _patch_metrics(metrics):
-            profile = RequestProfile(prompt_tokens=100)
+            profile = RequestProfile(prompt_tokens=50000, max_tokens=1000)
             await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # После выбора last_activity должен быть обновлён для выбранной реплики
-            # (обе idle, одна будет выбрана, её last_activity станет ~now)
-            assert (
-                strategy._last_activity[1] >= now or strategy._last_activity[2] >= now
-            )
+            # WLC should have been added for the selected instance
+            assert strategy._wlc.get(1) > 0 or strategy._wlc.get(2) > 0
 
+
+# ---------------------------------------------------------------------------
+# SmartLoadBalancingStrategy — Circuit Breaker integration
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerIntegration:
     @pytest.mark.asyncio
-    async def test_idle_bonus_not_applied_for_dirty_replica(self):
-        """Idle bonus не применяется если реплика не чистая (kv >= 0.25)."""
+    async def test_open_circuit_excludes_instance(self):
         strategy = SmartLoadBalancingStrategy()
         now = time.monotonic()
-
-        strategy._last_activity[1] = now - 20
-
-        # kv=0.30 >= 0.25, не считается "чистой"
-        m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.30)
-        bonus = strategy._idle_bonus(1, m, "short", now)
-        assert bonus == 0.0
-
-    @pytest.mark.asyncio
-    async def test_idle_bonus_heavy_capped_lower(self):
-        """Для heavy запросов idle bonus ограничен до 1.0."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        strategy._last_activity[1] = now - 60
-
-        m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1)
-        bonus_heavy = strategy._idle_bonus(1, m, "heavy", now)
-        bonus_short = strategy._idle_bonus(1, m, "short", now)
-
-        # heavy: 60*0.2=12, capped at 1.0
-        assert bonus_heavy == 1.0
-        # short: 60*0.2=12, capped at 3.0
-        assert bonus_short == 3.0
-
-    @pytest.mark.asyncio
-    async def test_idle_bonus_not_applied_below_threshold(self):
-        """Если idle < threshold (10 сек), бонус = 0."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        strategy._last_activity[1] = now - 5  # только 5 сек
-
-        m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1)
-        bonus = strategy._idle_bonus(1, m, "short", now)
-        assert bonus == 0.0
-
-    @pytest.mark.asyncio
-    async def test_idle_bonus_does_not_override_affinity(self):
-        """Idle bonus не перебивает affinity: ограничен до 75% от affinity bonus."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        # inst2 простаивает долго
-        strategy._last_activity[1] = now
-        strategy._last_activity[2] = now - 30
-
-        # Установить affinity на inst1
-        profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
-        await strategy._bind_affinity(1, profile, now)
+        strategy._circuit_breaker.trip(1, now)
 
         metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.05),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.05),
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.3),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
+            profile = RequestProfile(prompt_tokens=100)
             result = await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # Affinity bonus (4.0) > idle bonus (capped at 3.0, limited to 75% = 2.25)
-            # inst1 выигрывает за счёт affinity
-            assert result.id == 1
+            assert result.id == 2
 
     @pytest.mark.asyncio
-    async def test_idle_bonus_initializes_with_now_not_zero(self):
-        """Новая реплика инициализируется с now, а не с 0."""
+    async def test_ewma_trips_circuit(self):
         strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
+        # Set EWMA above threshold
+        strategy._ewma._ewma[1] = 0.90
 
-        # inst1 впервые видится — _last_activity пуст
-        assert 1 not in strategy._last_activity
-
-        m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1)
-        bonus = strategy._idle_bonus(1, m, "short", now)
-        # setdefault инициализирует с now, idle_seconds = 0, бонус = 0
-        assert bonus == 0.0
-        # Убедиться, что теперь запись есть
-        assert strategy._last_activity[1] == now
-
-    @pytest.mark.asyncio
-    async def test_busy_replica_updates_last_activity(self):
-        """Если метрики показывают busy, last_activity обновляется."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-
-        strategy._last_activity[1] = now - 30  # была idle
-        strategy._last_activity[2] = now - 30
-
-        # inst1 busy (running=1), inst2 clean
         metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.4),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.90),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
             profile = RequestProfile(prompt_tokens=100)
             await strategy.select_instance(
                 [_make_instance(1), _make_instance(2)], profile
             )
-            # inst1 должна быть обновлена до now (была busy)
-            assert strategy._last_activity[1] >= now
+            # After selection, inst1 EWMA >= threshold -> circuit trips
+            assert strategy._circuit_breaker._get_state(1) == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# SmartLoadBalancingStrategy — Slow Start integration
+# ---------------------------------------------------------------------------
+
+
+class TestSlowStartIntegration:
+    @pytest.mark.asyncio
+    async def test_idle_instance_gets_slow_start_bonus(self):
+        strategy = SmartLoadBalancingStrategy()
+        now = time.monotonic()
+
+        # inst2 has been idle for 20 seconds (fully warmed up)
+        strategy._slow_start.mark_idle(2, now - 20)
+        strategy._slow_start.mark_active(1)
+
+        metrics = {
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
+        }
+        with _patch_metrics(metrics):
+            # Both instances identical except slow start
+            # PoT picks 2 candidates (only 2 exist), compares scores
+            # inst2 has slow_start bonus, lower score
+            profile = RequestProfile(prompt_tokens=100)
+            result = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile
+            )
+            assert result.id == 2
 
 
 # ---------------------------------------------------------------------------
@@ -605,28 +614,24 @@ class TestIdleBonus:
 class TestHeavyAffinity:
     @pytest.mark.asyncio
     async def test_heavy_rejects_affinity_when_running(self):
-        """Heavy не идёт через affinity если running > 0."""
         strategy = SmartLoadBalancingStrategy()
         m = InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.2)
         assert strategy._affinity_allowed(m, "heavy") is False
 
     @pytest.mark.asyncio
     async def test_heavy_rejects_affinity_when_kv_high(self):
-        """Heavy не идёт через affinity если kv >= 0.40."""
         strategy = SmartLoadBalancingStrategy()
         m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.40)
         assert strategy._affinity_allowed(m, "heavy") is False
 
     @pytest.mark.asyncio
     async def test_heavy_accepts_affinity_when_clean(self):
-        """Heavy идёт через affinity если инстанс чистый."""
         strategy = SmartLoadBalancingStrategy()
         m = InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.35)
         assert strategy._affinity_allowed(m, "heavy") is True
 
     @pytest.mark.asyncio
     async def test_medium_affinity_kv_threshold(self):
-        """Medium affinity kv порог теперь 0.55."""
         strategy = SmartLoadBalancingStrategy()
         m = InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.54)
         assert strategy._affinity_allowed(m, "medium") is True
@@ -635,195 +640,116 @@ class TestHeavyAffinity:
 
 
 # ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — inflight tokens
+# SmartLoadBalancingStrategy — clear_affinity
 # ---------------------------------------------------------------------------
 
 
-class TestInflightTokens:
+class TestClearAffinity:
     @pytest.mark.asyncio
-    async def test_inflight_tokens_accumulated_on_bind(self):
-        """inflight_tokens увеличивается при _bind_affinity."""
+    async def test_clear_session_affinity(self):
         strategy = SmartLoadBalancingStrategy()
         now = time.monotonic()
+        profile = RequestProfile(prompt_tokens=100, session_key="uid:42")
+        await strategy._finalize_selection(_make_instance(1), profile, now)
 
-        profile = RequestProfile(prompt_tokens=50000, max_tokens=1000)
-        await strategy._bind_affinity(1, profile, now)
-
-        assert strategy._inflight_tokens[1] == 51000
-
-    @pytest.mark.asyncio
-    async def test_inflight_tokens_affects_score(self):
-        """inflight_tokens добавляет penalty к score."""
-        strategy = SmartLoadBalancingStrategy()
-        strategy._inflight_tokens[1] = 50000
-        strategy._inflight_tokens[2] = 0
-
-        m = InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.3)
-        s1 = strategy._score(1, m, "short", 0.0, 0.0)
-        s2 = strategy._score(2, m, "short", 0.0, 0.0)
-
-        assert s1 > s2
-
-    @pytest.mark.asyncio
-    async def test_inflight_decay_when_running_drops(self):
-        """inflight_tokens уменьшается пропорционально при падении num_running."""
-        strategy = SmartLoadBalancingStrategy()
-        strategy._inflight_tokens[1] = 100000
-        strategy._last_running_count[1] = 4
-
-        # num_running упал с 4 до 2
-        strategy._decay_inflight_tokens(1, 2)
-        assert strategy._inflight_tokens[1] == 50000
-
-    @pytest.mark.asyncio
-    async def test_inflight_decay_zero_running(self):
-        """inflight_tokens сбрасывается полностью когда num_running=0."""
-        strategy = SmartLoadBalancingStrategy()
-        strategy._inflight_tokens[1] = 100000
-        strategy._last_running_count[1] = 3
-
-        strategy._decay_inflight_tokens(1, 0)
-        assert strategy._inflight_tokens[1] == 0
-
-    @pytest.mark.asyncio
-    async def test_inflight_decay_no_change_when_running_same(self):
-        """inflight_tokens не меняется когда num_running тот же."""
-        strategy = SmartLoadBalancingStrategy()
-        strategy._inflight_tokens[1] = 100000
-        strategy._last_running_count[1] = 2
-
-        strategy._decay_inflight_tokens(1, 2)
-        assert strategy._inflight_tokens[1] == 100000
+        assert strategy._session_affinity.get("uid:42") == 1
+        await strategy.clear_affinity("uid:42")
+        assert strategy._session_affinity.get("uid:42") is None
 
 
 # ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — burst mode
+# SmartLoadBalancingStrategy — no instances
 # ---------------------------------------------------------------------------
 
 
-class TestBurstMode:
+class TestNoInstances:
     @pytest.mark.asyncio
-    async def test_burst_enables_when_all_waiting(self):
-        """Burst mode включается когда все инстансы имеют waiting > 0."""
+    async def test_raises_on_empty_list(self):
         strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        metrics = {
-            1: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-            2: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-        }
-        with _patch_metrics(metrics):
-            strategy._update_burst_mode([_make_instance(1), _make_instance(2)], now)
-            assert strategy._burst_active is True
-            assert strategy._burst_until > now
+        profile = RequestProfile(prompt_tokens=100)
 
-    @pytest.mark.asyncio
-    async def test_burst_disables_after_timer(self):
-        """Burst mode выключается когда таймер истёк."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        metrics = {
-            1: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-            2: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-        }
-        with _patch_metrics(metrics):
-            strategy._update_burst_mode([_make_instance(1), _make_instance(2)], now)
-            assert strategy._burst_active is True
-
-            # Симулируем истечение таймера
-            strategy._update_burst_mode(
-                [_make_instance(1), _make_instance(2)],
-                now + 100,  # далеко в будущем
-            )
-            assert strategy._burst_active is False
-
-    @pytest.mark.asyncio
-    async def test_burst_does_not_enable_when_not_all_waiting(self):
-        """Burst mode не включается если не все waiting."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=1, kv_cache_usage=0.5),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-        }
-        with _patch_metrics(metrics):
-            strategy._update_burst_mode([_make_instance(1), _make_instance(2)], now)
-            assert strategy._burst_active is False
+        with pytest.raises(RuntimeError, match="No running instances"):
+            await strategy.select_instance([], profile)
 
 
 # ---------------------------------------------------------------------------
-# SmartLoadBalancingStrategy — headroom multiplier
+# Integration: PoT + CHWBL + Circuit Breaker
 # ---------------------------------------------------------------------------
 
 
-class TestHeadroomMultiplier:
+class TestIntegration:
     @pytest.mark.asyncio
-    async def test_headroom_increases_when_all_waiting(self):
-        """Headroom multiplier увеличивается когда все waiting."""
+    async def test_pot_with_circuit_breaker_and_ewma(self):
+        """PoT selects from admissible pool; circuit breaker excludes; EWMA smooths."""
         strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        strategy._last_headroom_update = now - 100  # прошло достаточно времени
-        metrics = {
-            1: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-            2: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-        }
-        with _patch_metrics(metrics):
-            strategy._update_headroom([_make_instance(1), _make_instance(2)], now)
-            assert strategy._headroom_multiplier == 1.3
 
-    @pytest.mark.asyncio
-    async def test_headroom_decreases_when_low_kv(self):
-        """Headroom multiplier уменьшается когда средний KV низкий."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        strategy._last_headroom_update = now - 100
-        metrics = {
-            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.1),
-            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.05),
-        }
-        with _patch_metrics(metrics):
-            strategy._update_headroom([_make_instance(1), _make_instance(2)], now)
-            assert strategy._headroom_multiplier == 0.85
+        # Set EWMA for inst1 high (but below circuit breaker threshold)
+        strategy._ewma._ewma[1] = 0.60
+        strategy._ewma._ewma[2] = 0.20
 
-    @pytest.mark.asyncio
-    async def test_headroom_normal_when_mixed(self):
-        """Headroom multiplier = 1.0 при смешанной нагрузке."""
-        strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        strategy._last_headroom_update = now - 100
         metrics = {
-            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.4),
+            1: InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.5),
             2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
-            strategy._update_headroom([_make_instance(1), _make_instance(2)], now)
-            assert strategy._headroom_multiplier == 1.0
+            profile = RequestProfile(prompt_tokens=100)
+            result = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile
+            )
+            # inst2 has lower EWMA and no running requests — should win
+            assert result.id == 2
 
     @pytest.mark.asyncio
-    async def test_headroom_respects_interval(self):
-        """Headroom не обновляется чаще чем LB_HEADROOM_INTERVAL."""
+    async def test_chwbl_prefix_affinity_with_fallback(self):
+        """CHWBL routes to correct instance; falls back if overloaded."""
         strategy = SmartLoadBalancingStrategy()
-        now = time.monotonic()
-        strategy._last_headroom_update = now  # только что обновлено
+
         metrics = {
-            1: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
-            2: InstanceMetrics(num_running=2, num_waiting=1, kv_cache_usage=0.5),
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
         }
         with _patch_metrics(metrics):
-            strategy._update_headroom([_make_instance(1), _make_instance(2)], now)
-            # Не должно обновиться, так как прошло < 30 секунд
-            assert strategy._headroom_multiplier == 1.0
+            profile = RequestProfile(
+                prompt_tokens=100,
+                prefix_key="prefix:abc123",
+            )
+            # First call: establishes CHWBL mapping
+            r1 = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile
+            )
+            # Second call: same prefix should map to same instance (via hash ring)
+            r2 = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile
+            )
+            assert r1.id == r2.id
 
     @pytest.mark.asyncio
-    async def test_headroom_applied_to_admission(self):
-        """Headroom multiplier применяется к KV-порогу в admission."""
+    async def test_full_flow_session_then_prefix(self):
+        """Session affinity takes precedence over prefix affinity."""
         strategy = SmartLoadBalancingStrategy()
-        strategy._headroom_multiplier = 1.3
 
-        # medium max_kv = 0.50, * 1.3 = 0.65
-        # kv=0.60 <= 0.65, должно быть admissible
-        m = InstanceMetrics(num_running=1, num_waiting=0, kv_cache_usage=0.60)
-        assert strategy._admissible(m, "medium") is True
+        metrics = {
+            1: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
+            2: InstanceMetrics(num_running=0, num_waiting=0, kv_cache_usage=0.2),
+        }
+        with _patch_metrics(metrics):
+            # First: session + prefix
+            profile1 = RequestProfile(
+                prompt_tokens=100,
+                session_key="uid:42",
+                prefix_key="prefix:abc",
+            )
+            r1 = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile1
+            )
 
-        # Без headroom: kv=0.60 > 0.50, inadmissible
-        strategy._headroom_multiplier = 1.0
-        assert strategy._admissible(m, "medium") is False
+            # Second: same session, different prefix — session wins
+            profile2 = RequestProfile(
+                prompt_tokens=100,
+                session_key="uid:42",
+                prefix_key="prefix:xyz",
+            )
+            r2 = await strategy.select_instance(
+                [_make_instance(1), _make_instance(2)], profile2
+            )
+            assert r1.id == r2.id

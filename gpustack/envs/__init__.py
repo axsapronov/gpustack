@@ -304,69 +304,39 @@ LB_TOTAL_MEDIUM_THRESHOLD = int(
     os.getenv("GPUSTACK_LB_TOTAL_MEDIUM_THRESHOLD", "20000")
 )
 
-# Scoring weights (base)
-LB_WEIGHT_RUNNING = float(os.getenv("GPUSTACK_LB_W_RUNNING", "5.0"))
-LB_WEIGHT_WAITING = float(os.getenv("GPUSTACK_LB_W_WAITING", "8.0"))
-LB_WEIGHT_KV = float(os.getenv("GPUSTACK_LB_W_KV", "12.0"))
+# Power of Two Choices (PoT) scoring
+# KV usage coefficient in the PoT score: score = running + waiting + alpha * kv
+LB_POT_ALPHA = float(os.getenv("GPUSTACK_LB_POT_ALPHA", "2.5"))
 
-# Additional scoring weights for medium class
-LB_MEDIUM_EXTRA_RUNNING = float(os.getenv("GPUSTACK_LB_MEDIUM_EXTRA_RUNNING", "2.0"))
-LB_MEDIUM_EXTRA_KV = float(os.getenv("GPUSTACK_LB_MEDIUM_EXTRA_KV", "4.0"))
+# Peak EWMA — exponentially weighted moving average for KV cache smoothing
+# alpha when load is rising (fast reaction to overload)
+LB_EWMA_ALPHA_RISE = float(os.getenv("GPUSTACK_LB_EWMA_ALPHA_RISE", "0.7"))
+# alpha when load is falling (slow decay, remembers overload)
+LB_EWMA_ALPHA_FALL = float(os.getenv("GPUSTACK_LB_EWMA_ALPHA_FALL", "0.3"))
 
-# Additional scoring weights for heavy class
-LB_HEAVY_EXTRA_RUNNING = float(os.getenv("GPUSTACK_LB_HEAVY_EXTRA_RUNNING", "6.0"))
-LB_HEAVY_EXTRA_KV = float(os.getenv("GPUSTACK_LB_HEAVY_EXTRA_KV", "10.0"))
+# Consistent Hashing with Bounded Loads (CHWBL)
+# Number of virtual nodes per instance on the hash ring
+LB_CHWBL_VNODES = int(os.getenv("GPUSTACK_LB_CHWBL_VNODES", "100"))
+# Overload factor: if inflight > avg * factor, skip to next node on ring
+LB_CHWBL_OVERLOAD_FACTOR = float(os.getenv("GPUSTACK_LB_CHWBL_OVERLOAD_FACTOR", "1.5"))
 
-# In-flight tokens weight (penalizes instances with heavy workloads)
-# Default 0.0001 means 48000 inflight tokens add ~4.8 to the score
-LB_WEIGHT_INFLIGHT_TOKENS = float(
-    os.getenv("GPUSTACK_LB_WEIGHT_INFLIGHT_TOKENS", "0.0001")
+# Circuit Breaker
+# Timeout in seconds before transitioning from OPEN to HALF-OPEN
+LB_CIRCUIT_BREAKER_TIMEOUT = float(
+    os.getenv("GPUSTACK_LB_CIRCUIT_BREAKER_TIMEOUT", "9.0")
+)
+# KV threshold to trip the circuit breaker (instance goes OPEN)
+LB_CIRCUIT_BREAKER_KV_THRESHOLD = float(
+    os.getenv("GPUSTACK_LB_CIRCUIT_BREAKER_KV_THRESHOLD", "0.85")
 )
 
-# Affinity bonuses
+# Slow Start — gradually increase traffic weight after idle period
+# Window in seconds for the slow-start ramp-up
+LB_SLOW_START_WINDOW = float(os.getenv("GPUSTACK_LB_SLOW_START_WINDOW", "15.0"))
+# Aggression: 1.0 = linear ramp, 2.0 = convex (faster early), 0.5 = concave
+LB_SLOW_START_AGGRESSION = float(os.getenv("GPUSTACK_LB_SLOW_START_AGGRESSION", "1.0"))
+
+# Session affinity bonus (used in PoT scoring when session is pinned)
 LB_AFFINITY_SESSION_BONUS = float(
     os.getenv("GPUSTACK_LB_AFFINITY_SESSION_BONUS", "4.0")
-)
-LB_AFFINITY_PREFIX_BONUS = float(os.getenv("GPUSTACK_LB_AFFINITY_PREFIX_BONUS", "6.0"))
-
-# Cooldown / hysteresis
-LB_COOLDOWN_KV_HIGH = float(os.getenv("GPUSTACK_LB_COOLDOWN_KV_HIGH", "0.80"))
-LB_COOLDOWN_KV_LOW = float(os.getenv("GPUSTACK_LB_COOLDOWN_KV_LOW", "0.65"))
-LB_COOLDOWN_DURATION = float(os.getenv("GPUSTACK_LB_COOLDOWN_DURATION", "20.0"))
-
-# Idle bonus — prefer replicas that have been idle (tie-breaker only)
-# Applied only when replica is truly clean (running=0, waiting=0, kv<0.25).
-# Capped per class: heavy=1.0, medium=3.0, short=3.0.
-LB_IDLE_BONUS_THRESHOLD = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_THRESHOLD", "10.0"))
-LB_IDLE_BONUS_PER_SECOND = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_PER_SECOND", "0.2"))
-LB_IDLE_BONUS_MAX = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX", "3.0"))
-LB_IDLE_BONUS_MAX_HEAVY = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_HEAVY", "1.0"))
-LB_IDLE_BONUS_MAX_MEDIUM = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_MEDIUM", "3.0"))
-LB_IDLE_BONUS_MAX_SHORT = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_SHORT", "3.0"))
-LB_IDLE_KV_THRESHOLD = float(os.getenv("GPUSTACK_LB_IDLE_KV_THRESHOLD", "0.25"))
-
-# In-flight tokens scoring weight
-# Scaled so that 48000 tokens add ~4.8 to the score
-# Lower value (0.00005 means 48000 tokens add ~2.4, keeping affinity dominant
-LB_WEIGHT_INFLIGHT_TOKENS = float(
-    os.getenv("GPUSTACK_LB_WEIGHT_INFLIGHT_TOKENS", "0.00005")
-)
-
-# Burst mode — temporarily relax admission when all replicas have waiting requests
-LB_BURST_DURATION = float(os.getenv("GPUSTACK_LB_BURST_DURATION", "10.0"))
-LB_BURST_KV_MULTIPLIER = float(os.getenv("GPUSTACK_LB_BURST_KV_MULTIPLIER", "1.5"))
-LB_BURST_EXTRA_RUNNING = int(os.getenv("GPUSTACK_LB_BURST_EXTRA_RUNNING", "1"))
-
-# Adaptive headroom multiplier — scale KV thresholds based on cluster load
-# Range [0.85, 1.3], updated at most every LB_HEADROOM_INTERVAL seconds
-LB_HEADROOM_INTERVAL = float(os.getenv("GPUSTACK_LB_HEADROOM_INTERVAL", "60.0"))
-LB_HEADROOM_MIN = float(os.getenv("GPUSTACK_LB_HEADROOM_MIN", "0.85"))
-LB_HEADROOM_MAX = float(os.getenv("GPUSTACK_LB_HEADROOM_MAX", "1.3"))
-LB_HEADROOM_LOW_KV = float(os.getenv("GPUSTACK_LB_HEADROOM_LOW_KV", "0.15"))
-
-# Soft affinity — additional bonus for the pinned instance during scoring.
-# Allows idle replicas to override affinity when the load imbalance is large.
-# Tunes the balance between "keep session on one replica" and "involve idle replicas".
-LB_SOFT_AFFINITY_REBALANCE_BONUS = float(
-    os.getenv("GPUSTACK_LB_SOFT_AFFINITY_REBALANCE_BONUS", "2.0")
 )
