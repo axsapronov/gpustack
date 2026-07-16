@@ -70,6 +70,17 @@ def setup_logging(debug: bool = False):
         else:
             logger.disabled = True
 
+    # Smart load balancing loggers — always at INFO regardless of debug flag
+    smart_lb_logger_names = [
+        "gpustack.http_proxy.strategies",
+        "gpustack.http_proxy.instance_metrics_cache",
+        "gpustack.routes.openai",
+    ]
+
+    for logger_name in smart_lb_logger_names:
+        lg = logging.getLogger(logger_name)
+        lg.setLevel(logging.INFO)
+
 
 def trace(self, message, *args, **kwargs):
     if self.isEnabledFor(TRACE_LEVEL):

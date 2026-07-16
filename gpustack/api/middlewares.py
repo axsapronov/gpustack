@@ -52,12 +52,24 @@ def _warn_about_missing_start_time() -> None:
     )
 
 
+def _is_client_disconnect_error(e: Exception) -> bool:
+    """Check if the exception is a client disconnect error from BaseHTTPMiddleware."""
+    return isinstance(e, RuntimeError) and "No response returned" in str(e)
+
+
 class RequestTimeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request.state.start_time = datetime.now(timezone.utc)
         try:
             response = await call_next(request)
         except Exception as e:
+            if _is_client_disconnect_error(e):
+                logger.warning(
+                    "Client disconnected during request %s %s",
+                    request.method,
+                    request.url.path,
+                )
+                return Response(status_code=499, content="")
             # Log the full traceback so unexpected errors don't disappear
             # behind the generic 500 response. The exception is otherwise
             # serialized only via str(e), which often hides the real cause
@@ -80,7 +92,17 @@ class RequestTimeMiddleware(BaseHTTPMiddleware):
 
 class ModelUsageMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            if _is_client_disconnect_error(e):
+                logger.warning(
+                    "Client disconnected during request %s %s",
+                    request.method,
+                    request.url.path,
+                )
+                return Response(status_code=499, content="")
+            raise
         if response.status_code == 200:
             path = request.url.path
             if path == "/v1-openai/chat/completions" or path == "/v1/chat/completions":
@@ -408,7 +430,17 @@ def add_metrics(response_dict, request, response_chunk):
 
 class RefreshTokenMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except RuntimeError as e:
+            if "No response returned" in str(e):
+                logger.warning(
+                    "Client disconnected during request %s %s",
+                    request.method,
+                    request.url.path,
+                )
+                return Response(status_code=499, content="")
+            raise
 
         jwt_manager: JWTManager = request.app.state.jwt_manager
         token = request.cookies.get(SESSION_COOKIE_NAME)

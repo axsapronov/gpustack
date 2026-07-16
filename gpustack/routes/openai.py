@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import random
@@ -59,6 +60,136 @@ from gpustack.gateway.utils import (
 logger = logging.getLogger(__name__)
 
 load_balancer = LoadBalancer()
+
+
+def _estimate_prompt_tokens(body_json: Optional[dict]) -> int:
+    """
+    Быстрая оценка длины промпта в токенах без полного tokenize.
+    Правило: 1 токен ≈ 3 символа (консервативная оценка между eng и ru/zh).
+    Возвращает 0 если body_json недоступен (например, form-data).
+    """
+    if not body_json:
+        logger.debug("[smart_lb] _estimate_prompt_tokens: no body_json, returning 0")
+        return 0
+    try:
+        total_chars = 0
+        messages = body_json.get("messages", [])
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                # Multimodal: content is list of dicts
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total_chars += len(part.get("text", ""))
+
+        # Legacy: prompt field (non-chat completions)
+        prompt = body_json.get("prompt")
+        if isinstance(prompt, str):
+            total_chars += len(prompt)
+
+        estimated = total_chars // 3
+        logger.debug(
+            "[smart_lb] _estimate_prompt_tokens: chars=%d -> estimated_tokens=%d "
+            "(msg_count=%d has_prompt=%s)",
+            total_chars,
+            estimated,
+            len(messages),
+            bool(body_json.get("prompt")),
+        )
+        return estimated
+    except Exception:
+        logger.warning(
+            "[smart_lb] _estimate_prompt_tokens: error parsing body", exc_info=True
+        )
+        return 0
+
+
+def _extract_max_tokens(body_json: Optional[dict]) -> int:
+    """Извлечь ожидаемую длину ответа в токенах."""
+    if not body_json:
+        return 0
+    val = int(
+        body_json.get("max_completion_tokens") or body_json.get("max_tokens") or 0
+    )
+    logger.debug(
+        "[smart_lb] _extract_max_tokens: max_completion_tokens=%s max_tokens=%s -> %d",
+        body_json.get("max_completion_tokens"),
+        body_json.get("max_tokens"),
+        val,
+    )
+    return val
+
+
+def _extract_prefix_key(body_json: Optional[dict]) -> Optional[str]:
+    """
+    Извлечь hash системного промпта для prefix-cache affinity.
+    Берём первые 1024 символа system-сообщения и хэшируем MD5.
+    """
+    if not body_json:
+        return None
+
+    messages = body_json.get("messages", [])
+    if not messages:
+        return None
+
+    first = messages[0]
+    if first.get("role") != "system":
+        logger.debug(
+            "[smart_lb] prefix_key: first msg role=%s (expected 'system'), skipping",
+            first.get("role"),
+        )
+        return None
+
+    content = first.get("content", "")
+    if not isinstance(content, str) or not content:
+        return None
+
+    prefix = content[:1024]
+    digest = hashlib.md5(prefix.encode("utf-8")).hexdigest()[:12]
+    key = f"prefix:{digest}"
+    logger.debug(
+        "[smart_lb] prefix_key: %s (system_prompt_len=%d)",
+        key,
+        len(content),
+    )
+    return key
+
+
+def _extract_session_key(
+    request: Request, body_json: Optional[dict], user
+) -> Optional[str]:
+    """
+    Извлечь ключ сессии для session affinity.
+    Приоритет:
+    1. Кастомный заголовок X-Session-Id (из клиента / агента)
+    2. user поле в теле запроса (OpenAI-совместимое)
+    3. user_id из аутентифицированного пользователя
+    """
+    # 1. Кастомный session header
+    session_id = request.headers.get("x-session-id")
+    if session_id:
+        key = f"session:{session_id}"
+        logger.debug("[smart_lb] session_key from x-session-id header: %s", key)
+        return key
+
+    # 2. user из тела (OpenAI-совместимо)
+    if body_json:
+        user_field = body_json.get("user")
+        if user_field:
+            key = f"user:{user_field}"
+            logger.debug("[smart_lb] session_key from body.user: %s", key)
+            return key
+
+    # 3. Аутентифицированный user_id
+    if user and hasattr(user, "id"):
+        key = f"uid:{user.id}"
+        logger.debug("[smart_lb] session_key from auth user.id: %s", key)
+        return key
+
+    logger.debug("[smart_lb] session_key: none (no header, no body.user, no auth)")
+    return None
 
 
 # Endpoints served by a dedicated server router (e.g. rerank.router), so the
@@ -241,8 +372,20 @@ async def proxy_request_by_model(
 
         mutate_request(request, model_name, body_json, form_data)
 
+        # Сбор параметров для smart load balancing
+        prompt_tokens = _estimate_prompt_tokens(body_json)
+        max_tokens = _extract_max_tokens(body_json)
+        session_key = _extract_session_key(request, body_json, user)
+        prefix_key = _extract_prefix_key(body_json)
+
         instance = await get_running_instance(
-            session, model.id, target.overridden_model_name
+            session,
+            model.id,
+            target.overridden_model_name,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            session_key=session_key,
+            prefix_key=prefix_key,
         )
         worker: Worker = await WorkerService(session).get_by_id(instance.worker_id)
         if not worker:
@@ -445,9 +588,11 @@ async def _stream_response(
                 type="ServiceUnavailable",
             ),
         )
-        yield _error_chunk(
-            error_response, yielded_any
-        ), {}, status.HTTP_503_SERVICE_UNAVAILABLE
+        yield (
+            _error_chunk(error_response, yielded_any),
+            {},
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     except Exception as e:
         logger.error(f"Error streaming from worker {worker.id}: {e}", exc_info=True)
         error_response = OpenAIAPIErrorResponse(
@@ -457,9 +602,11 @@ async def _stream_response(
                 type="InternalServerError",
             ),
         )
-        yield _error_chunk(
-            error_response, yielded_any
-        ), {}, status.HTTP_500_INTERNAL_SERVER_ERROR
+        yield (
+            _error_chunk(error_response, yielded_any),
+            {},
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def _error_chunk(error_response: OpenAIAPIErrorResponse, mid_stream: bool) -> str:
@@ -489,6 +636,10 @@ async def get_running_instance(
     session: AsyncSession,
     model_id: int,
     overridden_model_name: Optional[str] = None,
+    prompt_tokens: int = 0,
+    max_tokens: int = 0,
+    session_key: Optional[str] = None,
+    prefix_key: Optional[str] = None,
 ):
     """Pick a RUNNING instance, narrowing by ``mounted_loras`` when a
     LoRA ``overridden_model_name`` is given. The filter is needed
@@ -518,7 +669,13 @@ async def get_running_instance(
                 ),
                 is_openai_exception=True,
             )
-    return await load_balancer.get_instance(running_instances)
+    return await load_balancer.get_instance(
+        running_instances,
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        session_key=session_key,
+        prefix_key=prefix_key,
+    )
 
 
 def mutate_request(

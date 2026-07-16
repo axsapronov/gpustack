@@ -304,11 +304,7 @@ class Server:
         self._start_extension_plugins(app)
         self._start_gpustack_operator_subscription()
 
-        serving_host = (
-            "127.0.0.1"
-            if self._config.gateway_mode == GatewayModeEnum.embedded
-            else "0.0.0.0"
-        )
+        serving_host = "0.0.0.0"
 
         config = uvicorn.Config(
             app,

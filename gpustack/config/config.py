@@ -954,7 +954,7 @@ class Config(WorkerConfig, BaseSettings):
         return self.proxy_port
 
     def get_proxy_listen_address(self, default: str = "0.0.0.0") -> str:
-        return "127.0.0.1" if self.gateway_mode == GatewayModeEnum.embedded else default
+        return default
 
     def get_proxy_url(self) -> Optional[str]:
         return f"http://{self.get_proxy_listen_address(self.get_advertise_address())}:{self.get_proxy_port()}"

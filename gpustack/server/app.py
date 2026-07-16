@@ -12,6 +12,7 @@ from gpustack.api import exceptions, middlewares
 from gpustack.api.auth import BearerTokenAuthenticator
 from gpustack.config.config import Config
 from gpustack import envs
+from gpustack.http_proxy import instance_metrics_cache
 from gpustack.routes import ui
 from gpustack.routes.routes import api_router
 from gpustack.utils.forwarded import ForwardedHostPortMiddleware
@@ -21,6 +22,21 @@ from gpustack.websocket_proxy.message_server import MessageServerHandler
 from gpustack.extension import Plugin, iter_plugin_classes
 
 logger = logging.getLogger(__name__)
+
+
+async def _get_all_running_instances():
+    """Получить все running инстансы для фонового кэша метрик."""
+    from gpustack.schemas.models import ModelInstance, ModelInstanceStateEnum
+    from gpustack.server.db import async_session
+    from sqlmodel import select
+
+    async with async_session() as session:
+        result = await session.exec(
+            select(ModelInstance).where(
+                ModelInstance.state == ModelInstanceStateEnum.RUNNING
+            )
+        )
+        return result.all()
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -35,7 +51,13 @@ def create_app(cfg: Config) -> FastAPI:
             connector=connector, trust_env=True
         )
         app.state.http_client_no_proxy = aiohttp.ClientSession(connector=connector)
+
+        # Запуск фонового кэша метрик для smart load balancing
+        instance_metrics_cache.start_metrics_cache(_get_all_running_instances)
+
         yield
+
+        instance_metrics_cache.stop_metrics_cache()
         await app.state.http_client.close()
         await app.state.http_client_no_proxy.close()
 

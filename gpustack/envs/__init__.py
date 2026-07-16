@@ -280,3 +280,93 @@ BENCHMARK_REQUEST_TIMEOUT = int(
 USAGE_BREAKDOWN_MAX_NO_PAGINATION_ROWS = int(
     os.getenv("GPUSTACK_USAGE_BREAKDOWN_MAX_NO_PAGINATION_ROWS", 50000)
 )
+
+# Smart Load Balancing configuration
+
+# Metrics cache
+LB_METRICS_REFRESH_INTERVAL = float(
+    os.getenv("GPUSTACK_LB_METRICS_REFRESH_INTERVAL", "3.0")
+)
+LB_METRICS_STALE_THRESHOLD = float(
+    os.getenv("GPUSTACK_LB_METRICS_STALE_THRESHOLD", "15.0")
+)
+LB_METRICS_FETCH_TIMEOUT = float(os.getenv("GPUSTACK_LB_METRICS_FETCH_TIMEOUT", "2.0"))
+
+# Request classification thresholds (in tokens)
+LB_PROMPT_HEAVY_THRESHOLD = int(
+    os.getenv("GPUSTACK_LB_PROMPT_HEAVY_THRESHOLD", "48000")
+)
+LB_TOTAL_HEAVY_THRESHOLD = int(os.getenv("GPUSTACK_LB_TOTAL_HEAVY_THRESHOLD", "56000"))
+LB_PROMPT_MEDIUM_THRESHOLD = int(
+    os.getenv("GPUSTACK_LB_PROMPT_MEDIUM_THRESHOLD", "12000")
+)
+LB_TOTAL_MEDIUM_THRESHOLD = int(
+    os.getenv("GPUSTACK_LB_TOTAL_MEDIUM_THRESHOLD", "20000")
+)
+
+# Scoring weights (base)
+LB_WEIGHT_RUNNING = float(os.getenv("GPUSTACK_LB_W_RUNNING", "5.0"))
+LB_WEIGHT_WAITING = float(os.getenv("GPUSTACK_LB_W_WAITING", "8.0"))
+LB_WEIGHT_KV = float(os.getenv("GPUSTACK_LB_W_KV", "12.0"))
+
+# Additional scoring weights for medium class
+LB_MEDIUM_EXTRA_RUNNING = float(os.getenv("GPUSTACK_LB_MEDIUM_EXTRA_RUNNING", "2.0"))
+LB_MEDIUM_EXTRA_KV = float(os.getenv("GPUSTACK_LB_MEDIUM_EXTRA_KV", "4.0"))
+
+# Additional scoring weights for heavy class
+LB_HEAVY_EXTRA_RUNNING = float(os.getenv("GPUSTACK_LB_HEAVY_EXTRA_RUNNING", "6.0"))
+LB_HEAVY_EXTRA_KV = float(os.getenv("GPUSTACK_LB_HEAVY_EXTRA_KV", "10.0"))
+
+# In-flight tokens weight (penalizes instances with heavy workloads)
+# Default 0.0001 means 48000 inflight tokens add ~4.8 to the score
+LB_WEIGHT_INFLIGHT_TOKENS = float(
+    os.getenv("GPUSTACK_LB_WEIGHT_INFLIGHT_TOKENS", "0.0001")
+)
+
+# Affinity bonuses
+LB_AFFINITY_SESSION_BONUS = float(
+    os.getenv("GPUSTACK_LB_AFFINITY_SESSION_BONUS", "4.0")
+)
+LB_AFFINITY_PREFIX_BONUS = float(os.getenv("GPUSTACK_LB_AFFINITY_PREFIX_BONUS", "6.0"))
+
+# Cooldown / hysteresis
+LB_COOLDOWN_KV_HIGH = float(os.getenv("GPUSTACK_LB_COOLDOWN_KV_HIGH", "0.80"))
+LB_COOLDOWN_KV_LOW = float(os.getenv("GPUSTACK_LB_COOLDOWN_KV_LOW", "0.65"))
+LB_COOLDOWN_DURATION = float(os.getenv("GPUSTACK_LB_COOLDOWN_DURATION", "20.0"))
+
+# Idle bonus — prefer replicas that have been idle (tie-breaker only)
+# Applied only when replica is truly clean (running=0, waiting=0, kv<0.25).
+# Capped per class: heavy=1.0, medium=3.0, short=3.0.
+LB_IDLE_BONUS_THRESHOLD = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_THRESHOLD", "10.0"))
+LB_IDLE_BONUS_PER_SECOND = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_PER_SECOND", "0.2"))
+LB_IDLE_BONUS_MAX = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX", "3.0"))
+LB_IDLE_BONUS_MAX_HEAVY = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_HEAVY", "1.0"))
+LB_IDLE_BONUS_MAX_MEDIUM = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_MEDIUM", "3.0"))
+LB_IDLE_BONUS_MAX_SHORT = float(os.getenv("GPUSTACK_LB_IDLE_BONUS_MAX_SHORT", "3.0"))
+LB_IDLE_KV_THRESHOLD = float(os.getenv("GPUSTACK_LB_IDLE_KV_THRESHOLD", "0.25"))
+
+# In-flight tokens scoring weight
+# Scaled so that 48000 tokens add ~4.8 to the score
+# Lower value (0.00005 means 48000 tokens add ~2.4, keeping affinity dominant
+LB_WEIGHT_INFLIGHT_TOKENS = float(
+    os.getenv("GPUSTACK_LB_WEIGHT_INFLIGHT_TOKENS", "0.00005")
+)
+
+# Burst mode — temporarily relax admission when all replicas have waiting requests
+LB_BURST_DURATION = float(os.getenv("GPUSTACK_LB_BURST_DURATION", "10.0"))
+LB_BURST_KV_MULTIPLIER = float(os.getenv("GPUSTACK_LB_BURST_KV_MULTIPLIER", "1.5"))
+LB_BURST_EXTRA_RUNNING = int(os.getenv("GPUSTACK_LB_BURST_EXTRA_RUNNING", "1"))
+
+# Adaptive headroom multiplier — scale KV thresholds based on cluster load
+# Range [0.85, 1.3], updated at most every LB_HEADROOM_INTERVAL seconds
+LB_HEADROOM_INTERVAL = float(os.getenv("GPUSTACK_LB_HEADROOM_INTERVAL", "60.0"))
+LB_HEADROOM_MIN = float(os.getenv("GPUSTACK_LB_HEADROOM_MIN", "0.85"))
+LB_HEADROOM_MAX = float(os.getenv("GPUSTACK_LB_HEADROOM_MAX", "1.3"))
+LB_HEADROOM_LOW_KV = float(os.getenv("GPUSTACK_LB_HEADROOM_LOW_KV", "0.15"))
+
+# Soft affinity — additional bonus for the pinned instance during scoring.
+# Allows idle replicas to override affinity when the load imbalance is large.
+# Tunes the balance between "keep session on one replica" and "involve idle replicas".
+LB_SOFT_AFFINITY_REBALANCE_BONUS = float(
+    os.getenv("GPUSTACK_LB_SOFT_AFFINITY_REBALANCE_BONUS", "2.0")
+)

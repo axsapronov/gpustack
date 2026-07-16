@@ -1,0 +1,32 @@
+services:
+  gpustack:
+    image: gpustack/gpustack:dev
+    container_name: gpustack
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - gpustack-data:/var/lib/gpustack
+      - ./gpustack/http_proxy/strategies.py:/usr/local/lib/python3.11/dist-packages/gpustack/http_proxy/strategies.py
+      - ./gpustack/envs/__init__.py:/usr/local/lib/python3.11/dist-packages/gpustack/envs/__init__.py
+      - ./gpustack/http_proxy/instance_metrics_cache.py:/usr/local/lib/python3.11/dist-packages/gpustack/http_proxy/instance_metrics_cache.py
+      - ./gpustack/http_proxy/load_balancer.py:/usr/local/lib/python3.11/dist-packages/gpustack/http_proxy/load_balancer.py
+      - ./gpustack/routes/openai.py:/usr/local/lib/python3.11/dist-packages/gpustack/routes/openai.py
+      - ./gpustack/server/app.py:/usr/local/lib/python3.11/dist-packages/gpustack/server/app.py
+      - ./gpustack/server/server.py:/usr/local/lib/python3.11/dist-packages/gpustack/server/server.py
+      - ./gpustack/logging.py:/usr/local/lib/python3.11/dist-packages/gpustack/logging.py
+      - ./gpustack/config/config.py:/usr/local/lib/python3.11/dist-packages/gpustack/config/config.py
+      - ./gpustack/api/middlewares.py:/usr/local/lib/python3.11/dist-packages/gpustack/api/middlewares.py
+    command: --database-url ${GPUSTACK_DATABASE_URL} --disable-worker --server-external-url http://192.168.0.45
+    # command: --disable-worker
+    env_file:
+      - .env
+    healthcheck:
+      test: curl --fail http://192.168.0.45/healthz || exit 1
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+
+
+volumes:
+  gpustack-data:
