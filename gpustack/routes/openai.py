@@ -162,33 +162,51 @@ def _extract_session_key(
 ) -> Optional[str]:
     """
     Извлечь ключ сессии для session affinity.
+
+    Использует ТОЛЬКО явные request-scoped идентификаторы.
+    Не использует user id, api token, auth subject, client ip как sticky key.
+
     Приоритет:
-    1. Кастомный заголовок X-Session-Id (из клиента / агента)
-    2. user поле в теле запроса (OpenAI-совместимое)
-    3. user_id из аутентифицированного пользователя
+    1. X-Session-Id header (явный session id от клиента/агента)
+    2. X-Conversation-Id header
+    3. conversation_id / thread_id из body JSON
+    4. X-Project-Id header (fallback для project-scoped affinity)
+    5. None — если явных идентификаторов нет, session affinity не применяется
     """
-    # 1. Кастомный session header
+    # 1. Явный session header
     session_id = request.headers.get("x-session-id")
     if session_id:
         key = f"session:{session_id}"
         logger.debug("[smart_lb] session_key from x-session-id header: %s", key)
         return key
 
-    # 2. user из тела (OpenAI-совместимо)
-    if body_json:
-        user_field = body_json.get("user")
-        if user_field:
-            key = f"user:{user_field}"
-            logger.debug("[smart_lb] session_key from body.user: %s", key)
-            return key
-
-    # 3. Аутентифицированный user_id
-    if user and hasattr(user, "id"):
-        key = f"uid:{user.id}"
-        logger.debug("[smart_lb] session_key from auth user.id: %s", key)
+    # 2. Conversation header
+    conversation_id = request.headers.get("x-conversation-id")
+    if conversation_id:
+        key = f"conversation:{conversation_id}"
+        logger.debug("[smart_lb] session_key from x-conversation-id header: %s", key)
         return key
 
-    logger.debug("[smart_lb] session_key: none (no header, no body.user, no auth)")
+    # 3. conversation_id / thread_id из body
+    if body_json:
+        for field_name in ("conversation_id", "thread_id"):
+            val = body_json.get(field_name)
+            if val:
+                key = f"body:{field_name}:{val}"
+                logger.debug("[smart_lb] session_key from body.%s: %s", field_name, key)
+                return key
+
+    # 4. Project header (fallback)
+    project_id = request.headers.get("x-project-id")
+    if project_id:
+        key = f"project:{project_id}"
+        logger.debug("[smart_lb] session_key from x-project-id header: %s", key)
+        return key
+
+    # 5. Нет явного идентификатора — не применяем session affinity
+    logger.debug(
+        "[smart_lb] session_key: none (no explicit session/conversation/project id)"
+    )
     return None
 
 

@@ -340,3 +340,38 @@ LB_SLOW_START_AGGRESSION = float(os.getenv("GPUSTACK_LB_SLOW_START_AGGRESSION", 
 LB_AFFINITY_SESSION_BONUS = float(
     os.getenv("GPUSTACK_LB_AFFINITY_SESSION_BONUS", "4.0")
 )
+
+# Feature flags for affinity types
+LB_ENABLE_SESSION_AFFINITY = str(
+    os.getenv("GPUSTACK_LB_ENABLE_SESSION_AFFINITY", "true")
+).lower() in ("true", "1", "yes")
+LB_ENABLE_PREFIX_AFFINITY = str(
+    os.getenv("GPUSTACK_LB_ENABLE_PREFIX_AFFINITY", "true")
+).lower() in ("true", "1", "yes")
+
+# Cluster imbalance detection thresholds
+# Cluster is imbalanced if max(queue_len) - min(queue_len) >= this value
+LB_IMBALANCED_QUEUE_THRESHOLD = int(
+    os.getenv("GPUSTACK_LB_IMBALANCED_QUEUE_THRESHOLD", "2")
+)
+# Cluster is imbalanced if max(kv) - min(kv) >= this value
+LB_IMBALANCED_KV_THRESHOLD = float(
+    os.getenv("GPUSTACK_LB_IMBALANCED_KV_THRESHOLD", "0.20")
+)
+
+# Affinity breaker thresholds
+# Break affinity if score(pinned) > score(best) * this ratio
+LB_AFFINITY_BREAK_SCORE_RATIO = float(
+    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_SCORE_RATIO", "1.10")
+)
+# Break affinity if running_pinned > min_running + this delta
+LB_AFFINITY_BREAK_RUNNING_DELTA = int(
+    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_RUNNING_DELTA", "1")
+)
+# Break affinity if kv_pinned > min_kv + this delta
+LB_AFFINITY_BREAK_KV_DELTA = float(
+    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_KV_DELTA", "0.15")
+)
+
+# Power of Two Choices: number of random candidates to sample
+LB_POT_CHOICE_COUNT = int(os.getenv("GPUSTACK_LB_POT_CHOICE_COUNT", "2"))

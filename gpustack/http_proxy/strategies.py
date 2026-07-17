@@ -414,7 +414,8 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
     - Weighted Least Connections for request-size awareness
     - Slow Start for warm-up after idle periods
     - Admission Control with request classification (short/medium/heavy)
-    - Session affinity via X-Session-Id
+    - Soft session affinity (explicit session ids only, no user/token sticky)
+    - Cluster imbalance detection with affinity breaker
     """
 
     def __init__(self) -> None:
@@ -498,34 +499,7 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                 m.is_stale(),
             )
 
-        # 1) Check session affinity first (hard pin if healthy)
-        session_pinned = self._check_session_affinity(
-            instances, profile, req_class, now
-        )
-        if session_pinned is not None:
-            await self._finalize_selection(session_pinned, profile, now)
-            self._log_selection(session_pinned, req_class, profile, "session_affinity")
-            return session_pinned
-
-        # 2) Check CHWBL prefix affinity (soft: only if not overloaded)
-        prefix_pinned = self._check_prefix_affinity(instances, profile, now)
-        prefix_pinned_id: Optional[int] = prefix_pinned.id if prefix_pinned else None
-
-        if prefix_pinned is not None:
-            m = get_metrics(prefix_pinned.id)
-            if self._admissible(m, req_class):
-                cb_state = self._circuit_breaker._get_state(prefix_pinned.id)
-                if cb_state != "OPEN":
-                    logger.debug(
-                        "[smart_lb] prefix affinity hit inst=%d "
-                        "(running=%.0f waiting=%.0f kv=%.3f)",
-                        prefix_pinned.id,
-                        m.num_running,
-                        m.num_waiting,
-                        m.kv_cache_usage,
-                    )
-
-        # 3) Admission control: split into admissible and fallback pools
+        # 1) Admission control: split into admissible and fallback pools
         admissible: List[Tuple[ModelInstance, InstanceMetrics]] = []
         fallback: List[Tuple[ModelInstance, InstanceMetrics, str]] = []
 
@@ -539,8 +513,6 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
 
             if self._admissible(m, req_class):
                 admissible.append((inst, m))
-            elif inst.id == prefix_pinned_id and self._affinity_allowed(m, req_class):
-                fallback.append((inst, m, "affinity_fallback"))
             else:
                 lim = LIMITS[req_class]
                 logger.debug(
@@ -566,7 +538,7 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             [f[0].id for f in fallback],
         )
 
-        # 4) Build selection pool
+        # 2) Build selection pool
         pool = (
             admissible if admissible else self._soft_fallback_pool(fallback, req_class)
         )
@@ -577,19 +549,144 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                 len(pool),
             )
 
-        # 5) Power of Two Choices selection
-        best = self._pot_select(pool, prefix_pinned_id, req_class, now)
+        if not pool:
+            raise RuntimeError("No suitable instance after admission control")
+
+        # 3) Determine cluster balance
+        balanced = self._is_cluster_balanced(pool)
+
+        # 4) Resolve session and prefix affinity candidates (soft preference)
+        session_candidate: Optional[ModelInstance] = None
+        session_broken_reason: Optional[str] = None
+
+        if envs.LB_ENABLE_SESSION_AFFINITY and profile.session_key:
+            session_candidate = self._get_session_candidate(
+                instances, profile, pool, req_class, now
+            )
+            if session_candidate is None:
+                # Check if it was broken (for logging)
+                pinned_id = self._session_affinity.get(profile.session_key)
+                if pinned_id is not None:
+                    pool_ids = set(inst.id for inst, _ in pool)
+                    if pinned_id in pool_ids:
+                        _, reason = self._should_break_affinity(
+                            pinned_id,
+                            pool,
+                            req_class,
+                            now,
+                        )
+                        session_broken_reason = reason
+                    else:
+                        session_broken_reason = "not_in_pool"
+
+        prefix_candidate: Optional[ModelInstance] = None
+        prefix_broken_reason: Optional[str] = None
+
+        if balanced and envs.LB_ENABLE_PREFIX_AFFINITY and profile.prefix_key:
+            prefix_candidate = self._get_prefix_candidate(
+                instances, profile, pool, req_class, now
+            )
+            if prefix_candidate is None:
+                # Check if it was broken (for logging)
+                if not self._hash_ring.is_empty:
+                    prefix_broken_reason = "broken_or_not_in_pool"
+
+        # 5) Determine preferred candidate
+        # In balanced mode: session > prefix > None
+        # In imbalanced mode: None (load-aware only)
+        preferred: Optional[ModelInstance] = None
+
+        if balanced:
+            if session_candidate:
+                preferred = session_candidate
+            elif prefix_candidate:
+                preferred = prefix_candidate
+
+        # 6) Power of Two Choices selection with affinity bonus for preferred
+        best = self._pot_select(
+            pool,
+            preferred.id if preferred else None,
+            req_class,
+            now,
+        )
 
         if best is None:
             raise RuntimeError("No suitable instance after admission control")
 
-        # 6) Finalize: bind affinity, update state
+        # 7) If preferred exists and its score is within 10% of selected, use preferred
+        if preferred and best.id != preferred.id:
+            pm = get_metrics(preferred.id)
+            bm = get_metrics(best.id)
+            score_preferred = self._pot_score(
+                preferred.id,
+                pm,
+                req_class,
+                True,
+                now,
+            )
+            score_selected = self._pot_score(
+                best.id,
+                bm,
+                req_class,
+                False,
+                now,
+            )
+            if score_preferred <= score_selected * envs.LB_AFFINITY_BREAK_SCORE_RATIO:
+                best = preferred
+
+        # 8) Determine log reason
+        reason = self._determine_reason(
+            best,
+            preferred,
+            session_broken_reason,
+            prefix_broken_reason,
+            balanced,
+            req_class,
+            profile,
+        )
+
+        # 9) Finalize: bind affinity, update state
         await self._finalize_selection(best, profile, now)
 
-        m = get_metrics(best.id)
-        reason = "prefix_affinity" if best.id == prefix_pinned_id else "pot"
-        self._log_selection(best, req_class, profile, reason)
+        # 10) Log selection
+        self._log_selection(
+            best,
+            req_class,
+            profile,
+            reason,
+            balanced=balanced,
+            session_broken_reason=session_broken_reason,
+            prefix_broken_reason=prefix_broken_reason,
+        )
         return best
+
+    # ---- Determine log reason ----
+
+    def _determine_reason(
+        self,
+        selected: ModelInstance,
+        preferred: Optional[ModelInstance],
+        session_broken_reason: Optional[str],
+        prefix_broken_reason: Optional[str],
+        balanced: bool,
+        req_class: str,
+        profile: RequestProfile,
+    ) -> str:
+        if session_broken_reason:
+            return f"affinity_broken_{session_broken_reason}"
+        if prefix_broken_reason:
+            return f"affinity_broken_{prefix_broken_reason}"
+        if preferred and preferred.id == selected.id:
+            if preferred_type := (
+                "session"
+                if profile.session_key
+                and self._session_affinity.get(profile.session_key) == selected.id
+                else "prefix"
+            ):
+                return f"{preferred_type}_affinity_soft"
+        if not balanced:
+            return "least_load_fallback"
+        return "power_of_two_choices"
 
     # ---- hash ring sync ----
 
@@ -652,16 +749,146 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                 ranked.append((inst, m))
         return ranked
 
-    # ---- session affinity ----
+    # ---- cluster balance detection ----
 
-    def _check_session_affinity(
+    def _is_cluster_balanced(
+        self,
+        pool: List[Tuple[ModelInstance, InstanceMetrics]],
+    ) -> bool:
+        """
+        Determine if the cluster is balanced.
+
+        Cluster is imbalanced if:
+        - max(queue_len) - min(queue_len) >= IMBALANCED_QUEUE_THRESHOLD
+        - or max(kv) - min(kv) >= IMBALANCED_KV_THRESHOLD
+
+        Returns True if balanced, False if imbalanced.
+        """
+        if len(pool) <= 1:
+            return True
+
+        queue_lens = [m.num_running + m.num_waiting for _, m in pool]
+        kvs = [m.kv_cache_usage for _, m in pool]
+
+        queue_spread = max(queue_lens) - min(queue_lens)
+        kv_spread = max(kvs) - min(kvs)
+
+        if queue_spread >= envs.LB_IMBALANCED_QUEUE_THRESHOLD:
+            logger.debug(
+                "[smart_lb] cluster imbalanced: queue_spread=%.0f >= %d",
+                queue_spread,
+                envs.LB_IMBALANCED_QUEUE_THRESHOLD,
+            )
+            return False
+
+        if kv_spread >= envs.LB_IMBALANCED_KV_THRESHOLD:
+            logger.debug(
+                "[smart_lb] cluster imbalanced: kv_spread=%.3f >= %.2f",
+                kv_spread,
+                envs.LB_IMBALANCED_KV_THRESHOLD,
+            )
+            return False
+
+        return True
+
+    # ---- affinity breaker ----
+
+    def _should_break_affinity(
+        self,
+        pinned_id: int,
+        pool: List[Tuple[ModelInstance, InstanceMetrics]],
+        req_class: str,
+        now: float,
+    ) -> Tuple[bool, str]:
+        """
+        Determine if pinned instance affinity should be broken.
+
+        Returns (should_break, reason_string).
+
+        Break conditions:
+        - pinned has waiting > 0
+        - pinned has running > class_running_limit
+        - pinned has kv > class_kv_limit
+        - score(pinned) > score(best) * AFFINITY_BREAK_SCORE_RATIO
+        - running_pinned > min_running + AFFINITY_BREAK_RUNNING_DELTA
+        - kv_pinned > min_kv + AFFINITY_BREAK_KV_DELTA
+
+        For heavy requests, thresholds are stricter.
+        """
+        pinned_metrics = None
+        for inst, m in pool:
+            if inst.id == pinned_id:
+                pinned_metrics = m
+                break
+
+        if pinned_metrics is None:
+            return True, "pinned_not_in_pool"
+
+        # Circuit breaker OPEN — always break
+        if self._circuit_breaker._get_state(pinned_id) == "OPEN":
+            return True, "circuit_open"
+
+        lim = LIMITS[req_class]
+
+        # waiting > 0
+        if pinned_metrics.num_waiting > 0:
+            return True, "waiting"
+
+        # running > class limit
+        if pinned_metrics.num_running > lim.max_running:
+            return True, "running"
+
+        # kv > class limit
+        if pinned_metrics.kv_cache_usage > lim.max_kv:
+            return True, "kv"
+
+        # Compare with cluster minimums
+        all_running = [m.num_running for _, m in pool]
+        all_kv = [m.kv_cache_usage for _, m in pool]
+        min_running = min(all_running)
+        min_kv = min(all_kv)
+
+        if (
+            pinned_metrics.num_running
+            > min_running + envs.LB_AFFINITY_BREAK_RUNNING_DELTA
+        ):
+            return True, "running_delta"
+
+        if pinned_metrics.kv_cache_usage > min_kv + envs.LB_AFFINITY_BREAK_KV_DELTA:
+            return True, "kv_delta"
+
+        # Score comparison
+        score_pinned = self._pot_score(pinned_id, pinned_metrics, req_class, False, now)
+        best_score = math.inf
+        for inst, m in pool:
+            s = self._pot_score(inst.id, m, req_class, False, now)
+            if s < best_score:
+                best_score = s
+
+        if score_pinned > best_score * envs.LB_AFFINITY_BREAK_SCORE_RATIO:
+            return True, "score"
+
+        return False, ""
+
+    # ---- session affinity (soft preference) ----
+
+    def _get_session_candidate(
         self,
         instances: List[ModelInstance],
         profile: RequestProfile,
+        pool: List[Tuple[ModelInstance, InstanceMetrics]],
         req_class: str,
         now: float,
     ) -> Optional[ModelInstance]:
-        """Check session affinity — hard pin if the pinned instance is healthy."""
+        """
+        Check session affinity — returns candidate if affinity should be preferred.
+
+        This is a SOFT preference: the pinned instance is returned only if
+        it is healthy and affinity should NOT be broken.
+        """
+        if not envs.LB_ENABLE_SESSION_AFFINITY:
+            return None
+
         if not profile.session_key:
             return None
 
@@ -673,23 +900,43 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
         if pinned_id not in ids_map:
             return None
 
-        inst = ids_map[pinned_id]
-
-        # Session affinity is hard: only release if circuit is OPEN
-        if self._circuit_breaker._get_state(inst.id) == "OPEN":
+        # Check if pinned is in the selection pool
+        pool_ids = {inst.id for inst, _ in pool}
+        if pinned_id not in pool_ids:
             return None
 
-        return inst
+        # Check affinity breaker
+        should_break, reason = self._should_break_affinity(
+            pinned_id, pool, req_class, now
+        )
+        if should_break:
+            logger.debug(
+                "[smart_lb] session affinity broken: inst=%d reason=%s",
+                pinned_id,
+                reason,
+            )
+            return None
+
+        return ids_map[pinned_id]
 
     # ---- prefix affinity (CHWBL) ----
 
-    def _check_prefix_affinity(
+    def _get_prefix_candidate(
         self,
         instances: List[ModelInstance],
         profile: RequestProfile,
+        pool: List[Tuple[ModelInstance, InstanceMetrics]],
+        req_class: str,
         now: float,
     ) -> Optional[ModelInstance]:
-        """Check CHWBL prefix affinity — soft pin, respects load bounds."""
+        """
+        Check CHWBL prefix affinity — soft preference, respects load bounds.
+
+        Only returns candidate in balanced mode and if affinity should not be broken.
+        """
+        if not envs.LB_ENABLE_PREFIX_AFFINITY:
+            return None
+
         if not profile.prefix_key:
             return None
 
@@ -711,7 +958,28 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             return None
 
         ids_map = {inst.id: inst for inst in instances}
-        return ids_map.get(pinned_id)
+        inst = ids_map.get(pinned_id)
+        if inst is None:
+            return None
+
+        # Check if pinned is in the selection pool
+        pool_ids = {i.id for i, _ in pool}
+        if pinned_id not in pool_ids:
+            return None
+
+        # Check affinity breaker
+        should_break, reason = self._should_break_affinity(
+            pinned_id, pool, req_class, now
+        )
+        if should_break:
+            logger.debug(
+                "[smart_lb] prefix affinity broken: inst=%d reason=%s",
+                pinned_id,
+                reason,
+            )
+            return None
+
+        return inst
 
     # ---- PoT scoring ----
 
@@ -760,13 +1028,15 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
     def _pot_select(
         self,
         pool: List[Tuple[ModelInstance, InstanceMetrics]],
-        prefix_pinned_id: Optional[int],
+        preferred_id: Optional[int],
         req_class: str,
         now: float,
     ) -> Optional[ModelInstance]:
         """
-        Power of Two Choices: pick 2 random candidates, return the one
+        Power of Two Choices: pick N random candidates, return the one
         with the lower score.
+
+        preferred_id receives affinity_bonus in scoring.
         """
         if not pool:
             return None
@@ -774,20 +1044,21 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
         if len(pool) == 1:
             return pool[0][0]
 
-        # Pick 2 random candidates
-        candidates = random.sample(pool, 2)
+        # Pick random candidates (configurable count, default 2)
+        choice_count = min(envs.LB_POT_CHOICE_COUNT, len(pool))
+        candidates = random.sample(pool, choice_count)
 
         best = None
         best_score = math.inf
 
         for inst, m in candidates:
-            is_pinned = inst.id == prefix_pinned_id
+            is_pinned = inst.id == preferred_id
             s = self._pot_score(inst.id, m, req_class, is_pinned, now)
 
             logger.debug(
                 "[smart_lb] pot score inst=%d final=%.2f "
                 "(running=%.0f waiting=%.0f ewma_kv=%.3f wlc=%d "
-                "pinned=%s slow_start=%.2f)",
+                "preferred=%s slow_start=%.2f)",
                 inst.id,
                 s,
                 m.num_running,
@@ -836,14 +1107,41 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
         req_class: str,
         profile: RequestProfile,
         reason: str,
+        balanced: bool = True,
+        session_broken_reason: Optional[str] = None,
+        prefix_broken_reason: Optional[str] = None,
     ) -> None:
         m = get_metrics(inst.id)
         ewma_val = self._ewma.get(inst.id)
+
+        # Determine session key source for logging
+        session_key_source = "none"
+        if profile.session_key:
+            if profile.session_key.startswith("session:"):
+                session_key_source = "x-session-id"
+            elif profile.session_key.startswith("conversation:"):
+                session_key_source = "x-conversation-id"
+            elif profile.session_key.startswith("body:"):
+                session_key_source = "body"
+            elif profile.session_key.startswith("project:"):
+                session_key_source = "x-project-id"
+
+        # Get pinned instance ids for logging
+        pinned_session_id = (
+            self._session_affinity.get(profile.session_key)
+            if profile.session_key
+            else None
+        )
+
         logger.info(
             "[smart_lb] >>> SELECTED inst=%d class=%s prompt=%d max=%d "
             "running=%.0f waiting=%.0f kv=%.3f ewma=%.3f reason=%s "
             "wlc=%d cb=%s slow_start=%.2f "
-            "session_key=%s prefix_key=%s",
+            "balanced=%s "
+            "session_key=%s session_key_source=%s "
+            "pinned_session=%s pinned_prefix=%s "
+            "prefix_key=%s "
+            "session_broken=%s prefix_broken=%s",
             inst.id,
             req_class,
             profile.prompt_tokens,
@@ -856,6 +1154,12 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             self._wlc.get(inst.id),
             self._circuit_breaker._get_state(inst.id),
             self._slow_start.get_weight(inst.id, time.monotonic()),
+            balanced,
             profile.session_key,
+            session_key_source,
+            pinned_session_id,
+            None,  # pinned_prefix determined dynamically via hash ring
             profile.prefix_key,
+            session_broken_reason,
+            prefix_broken_reason,
         )
