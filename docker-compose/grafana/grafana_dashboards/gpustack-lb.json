@@ -26,7 +26,7 @@
     }
   ],
   "cursorSync": "Crosshair",
-  "description": "Дашборд визуализирует работу **SmartLoadBalancingStrategy** — балансировщика GPUStack.\n\nИсточник данных — Prometheus-метрики `gpustack:lb_*` на `/metrics` HTTP-прокси.\n\n**Ключевые метрики:**\n1. Распределение prompt-размеров — профиль KV-нагрузки\n2. Эффективность affinity — как часто сессии прилипают к реплике\n3. Балансировка нагрузки — равномерность распределения по score\n4. Affinity streak — не монополизирует ли сессия реплику\n5. Классификация запросов — доля short/medium/heavy\n6. Задержка выбора — накладные расходы балансировщика\n",
+  "description": "Дашборд визуализирует работу **SmartLoadBalancingStrategy** — балансировщика GPUStack.\n",
   "editable": true,
   "elements": {
     "panel-1": {
@@ -49,87 +49,15 @@
                     "spec": {
                       "editorMode": "code",
                       "exemplar": true,
-                      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
-                      "instant": false,
+                      "expr": "sum(rate(gpustack:lb_requests_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": true,
                       "interval": "",
-                      "legendFormat": "p50",
-                      "range": true
+                      "legendFormat": "",
+                      "range": false
                     },
                     "version": "v0"
                   },
                   "refId": "A"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "p90",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "B"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "p95",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "C"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "p99",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "D"
                 }
               }
             ],
@@ -137,10 +65,459 @@
             "transformations": []
           }
         },
-        "description": "Распределение размера prompt в токенах по моделям. Показывает реальный профиль KV-нагрузки.",
+        "description": "Общая скорость запросов через балансер (запросов в минуту).",
         "id": 1,
         "links": [],
-        "title": "Prompt Tokens (percentiles)",
+        "title": "Request Rate",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 50
+                    },
+                    {
+                      "color": "red",
+                      "value": 100
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-10": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_instance_ewma_kv{job=\"$app_name\"}",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Сглаженное использование KV cache (Peak EWMA) по инстансам. Показывает реальную KV-нагрузку с учётом истории.",
+        "id": 10,
+        "links": [],
+        "title": "EWMA KV Cache",
+        "vizConfig": {
+          "group": "bargauge",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "continuous-GrYlRd"
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "percentunit"
+              },
+              "overrides": []
+            },
+            "options": {
+              "displayMode": "gradient",
+              "minVizHeight": 10,
+              "minVizWidth": 0,
+              "orientation": "horizontal",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showUnfilled": true,
+              "valueMode": "color"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-100": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Описание Smart Load Balancer дашборда.",
+        "id": 100,
+        "links": [],
+        "title": "",
+        "vizConfig": {
+          "group": "text",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {},
+              "overrides": []
+            },
+            "options": {
+              "code": {
+                "language": "plaintext",
+                "showLineNumbers": false,
+                "showMiniMap": false
+              },
+              "content": "# Smart Load Balancer\n\nДашборд визуализирует работу **SmartLoadBalancingStrategy** — балансировщика GPUStack.\n",
+              "mode": "markdown"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-101": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "",
+        "id": 101,
+        "links": [],
+        "title": "",
+        "vizConfig": {
+          "group": "text",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {},
+              "overrides": []
+            },
+            "options": {
+              "code": {
+                "language": "plaintext",
+                "showLineNumbers": false,
+                "showMiniMap": false
+              },
+              "content": "### Нагрузка (Load Intensity)\n\nЭта секция показывает общую интенсивность трафика, проходящего через балансер.\n\n**Что смотреть для анализа:**\n- **Request Rate** — мгновенная скорость запросов. Резкие скачки указывают на всплески нагрузки.\n- **Request Classification** — распределение по типу (short/medium/heavy). Сдвиг к heavy запросам означает рост вычислительной нагрузки.\n- **Token Throughput** — общая пропускная способность в токенах/мин. Коррелирует с загрузкой GPU.\n- **Prompt Tokens (percentiles)** — распределение размеров контекста. Высокие p95/p99 указывают на тяжёлые запросы, влияющие на KV-cache.\n",
+              "mode": "markdown"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-102": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "",
+        "id": 102,
+        "links": [],
+        "title": "",
+        "vizConfig": {
+          "group": "text",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {},
+              "overrides": []
+            },
+            "options": {
+              "code": {
+                "language": "plaintext",
+                "showLineNumbers": false,
+                "showMiniMap": false
+              },
+              "content": "### Эффективность балансировщика (Balancer Effectiveness)\n\nСекция показывает, насколько эффективно работает стратегия балансировки — affinity, streak-лимиты, и KV-cache сглаживание.\n\n**Что смотреть для анализа:**\n- **Affinity Efficiency** — соотношение причин селекции. Доминирование `affinity_soft` означает стабильные сессии.\n- **Affinity Hit Rate (%)** — процент affinity-хитов. >60% — хорошо, <30% — сессии нестабильны.\n- **Affinity Streak** — текущая серия affinity-хитов по репликам. Слишком высокие значения = монополизация.\n- **Streak Resets** — частота сбросов streak. Высокое значение = агрессивный cap или нестабильные сессии.\n- **KV Cache Usage (raw)** — мгновенное использование KV-кэша. Показывает пиковую нагрузку на VRAM.\n- **EWMA KV Cache** — сглаженное использование KV. Сравнивайте с raw для оценки пиковости.\n- **KV Efficiency Ratio** — отношение EWMA/raw. <1 означает эффективное сглаживание пиков.\n",
+              "mode": "markdown"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-103": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "",
+        "id": 103,
+        "links": [],
+        "title": "",
+        "vizConfig": {
+          "group": "text",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {},
+              "overrides": []
+            },
+            "options": {
+              "code": {
+                "language": "plaintext",
+                "showLineNumbers": false,
+                "showMiniMap": false
+              },
+              "content": "### Утилизация ресурсов (Resource Utilization)\n\nСекция показывает, насколько равномерно распределяется нагрузка между репликами.\n\n**Что смотреть для анализа:**\n- **Requests per Replica** — распределение запросов. Идеально — равномерные линии по репликам.\n- **Instance Score** — текущий score по репликам. Низкий score = свободная реплика.\n- **Score Over Time** — динамика score. Расхождения между линиями указывают на дисбаланс.\n- **Load Imbalance Ratio** — коэффициент дисбаланса (max/min score). 1 = идеально, >2 = перекос.\n- **WLC Weight** — вес активных соединений. Показывает вычислительную нагрузку на каждую реплику.\n- **Pool Size** — число здоровых реплик. Падения указывают на проблемы с инстансами.\n",
+              "mode": "markdown"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-104": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "",
+        "id": 104,
+        "links": [],
+        "title": "",
+        "vizConfig": {
+          "group": "text",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {},
+              "overrides": []
+            },
+            "options": {
+              "code": {
+                "language": "plaintext",
+                "showLineNumbers": false,
+                "showMiniMap": false
+              },
+              "content": "### Отладка (Debug)\n\nСекция для глубокой диагностики работы балансировщика — latency, slow start, и токены по репликам.\n\n**Что смотреть для анализа:**\n- **Selection Latency** — время работы `select_instance()`. Высокие p99 = проблемы с алгоритмом или пулом.\n- **Slow Start Weight** — вес slow-start по репликам. 1 = idle, 0 = активен. Должен быстро опускаться после простоя.\n- **Generation Tokens per Replica** — генерация токенов по репликам. Показывает реальную вычислительную нагрузку.\n- **Input Context per Replica** — input context по репликам. Коррелирует с KV-cache давлением.\n",
+              "mode": "markdown"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-11": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "avg(gpustack:lb_instance_ewma_kv{job=\"$app_name\"}) / avg(gpustack:lb_request_kv_cache_usage{job=\"$app_name\"})",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Отношение среднего EWMA KV к среднему raw KV. Показывает, насколько эффективно EWMA сглаживает пиковые значения. Значение < 1 означает, что EWMA снижает пиковую нагрузку.",
+        "id": 11,
+        "links": [],
+        "title": "KV Efficiency Ratio",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#EAB839",
+                      "value": 0
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 1.1
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-12": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Распределение запросов по репликам. Показывает, насколько равномерно балансирует нагрузку.",
+        "id": 12,
+        "links": [],
+        "title": "Requests per Replica",
         "vizConfig": {
           "group": "timeseries",
           "kind": "VizConfig",
@@ -159,7 +536,7 @@
                   "barAlignment": 0,
                   "barWidthFactor": 0.6,
                   "drawStyle": "line",
-                  "fillOpacity": 10,
+                  "fillOpacity": 20,
                   "gradientMode": "none",
                   "hideFrom": {
                     "legend": false,
@@ -178,11 +555,97 @@
                   "spanNulls": false,
                   "stacking": {
                     "group": "A",
-                    "mode": "none"
+                    "mode": "normal"
                   },
                   "thresholdsStyle": {
                     "mode": "off"
                   }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "multi",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-13": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_instance_score{job=\"$app_name\"}",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Текущий score по инстансам. Насколько равномерно распределяется нагрузка (ниже score — лучше).",
+        "id": 13,
+        "links": [],
+        "title": "Instance Score",
+        "vizConfig": {
+          "group": "bargauge",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "continuous-GrYlRd"
                 },
                 "thresholds": {
                   "mode": "absolute",
@@ -202,26 +665,26 @@
               "overrides": []
             },
             "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
+              "displayMode": "gradient",
+              "minVizHeight": 10,
+              "minVizWidth": 0,
+              "orientation": "horizontal",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
               },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "single",
-                "sort": "none"
-              }
+              "showUnfilled": true,
+              "valueMode": "color"
             }
           },
           "version": "13.1.0"
         }
       }
     },
-    "panel-10": {
+    "panel-14": {
       "kind": "Panel",
       "spec": {
         "data": {
@@ -258,7 +721,7 @@
           }
         },
         "description": "Динамика score по инстансам. Показывает, как меняется нагрузка на каждую реплику.",
-        "id": 10,
+        "id": 14,
         "links": [],
         "title": "Score Over Time",
         "vizConfig": {
@@ -341,44 +804,186 @@
         }
       }
     },
-    "panel-100": {
+    "panel-15": {
       "kind": "Panel",
       "spec": {
         "data": {
           "kind": "QueryGroup",
           "spec": {
-            "queries": [],
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "max(gpustack:lb_instance_score{job=\"$app_name\"}) / min(gpustack:lb_instance_score{job=\"$app_name\"})",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
             "queryOptions": {},
             "transformations": []
           }
         },
-        "description": "Описание Smart Load Balancer дашборда.",
-        "id": 100,
+        "description": "Коэффициент дисбаланса нагрузки: max(score) / min(score). Значение 1 означает идеальный баланс. Чем больше, тем сильнее перекос.",
+        "id": 15,
         "links": [],
-        "title": "",
+        "title": "Load Imbalance Ratio",
         "vizConfig": {
-          "group": "text",
+          "group": "stat",
           "kind": "VizConfig",
           "spec": {
             "fieldConfig": {
-              "defaults": {},
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "green",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 2
+                    },
+                    {
+                      "color": "red",
+                      "value": 5
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
               "overrides": []
             },
             "options": {
-              "code": {
-                "language": "plaintext",
-                "showLineNumbers": false,
-                "showMiniMap": false
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
               },
-              "content": "# Smart Load Balancer\n\nДашборд визуализирует работу **SmartLoadBalancingStrategy** — балансировщика GPUStack.\n\nИсточник данных — Prometheus-метрики `gpustack:lb_*` на `/metrics` HTTP-прокси.\n\n**Ключевые метрики:**\n1. Распределение prompt-размеров — профиль KV-нагрузки\n2. Эффективность affinity — как часто сессии прилипают к реплике\n3. Балансировка нагрузки — равномерность распределения по score\n4. Affinity streak — не монополизирует ли сессия реплику\n5. Классификация запросов — доля short/medium/heavy\n6. Задержка выбора — накладные расходы балансировщика\n",
-              "mode": "markdown"
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
             }
           },
           "version": "13.1.0"
         }
       }
     },
-    "panel-11": {
+    "panel-16": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_instance_wlc_weight{job=\"$app_name\"}",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Weighted Least Connections вес по инстансам. Сумма весов активных соединений (prompt + max_tokens).",
+        "id": 16,
+        "links": [],
+        "title": "WLC Weight",
+        "vizConfig": {
+          "group": "bargauge",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "continuous-GrYlRd"
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "displayMode": "gradient",
+              "minVizHeight": 10,
+              "minVizWidth": 0,
+              "orientation": "horizontal",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showUnfilled": true,
+              "valueMode": "color"
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-17": {
       "kind": "Panel",
       "spec": {
         "data": {
@@ -415,7 +1020,7 @@
           }
         },
         "description": "Число здоровых реплик в пуле. Должно быть стабильным; падения указывают на проблемы с инстансами.",
-        "id": 11,
+        "id": 17,
         "links": [],
         "title": "Pool Size",
         "vizConfig": {
@@ -498,607 +1103,7 @@
         }
       }
     },
-    "panel-12": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "gpustack:lb_instance_slow_start_weight{job=\"$app_name\"}",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Slow start вес по инстансам. 0 = активен, 1 = полностью idle. Показывает warm-up после простоя.",
-        "id": 12,
-        "links": [],
-        "title": "Slow Start Weight",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "none"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "single",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-13": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m]))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Суммарное количество запросов, распределённых по каждой реплике (instance_id).",
-        "id": 13,
-        "links": [],
-        "title": "Total Requests per Replica",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 20,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "reqps"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "multi",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-14": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * on (model_name) group_left() (avg by (model_name) (rate(gpustack:lb_request_max_tokens_sum{job=\"$app_name\"}[5m])))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Суммарная пропускная способность по генерации токенов (max_tokens) по каждой реплике.",
-        "id": 14,
-        "links": [],
-        "title": "Total Generation Tokens per Replica",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 20,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "multi",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-15": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * on (model_name) group_left() (avg by (model_name) (rate(gpustack:lb_request_prompt_tokens_sum{job=\"$app_name\"}[5m])))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Суммарная input context способность (prompt_tokens) по каждой реплике.",
-        "id": 15,
-        "links": [],
-        "title": "Total Input Context per Replica",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 20,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "multi",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-2": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "sum by (request_class, model_name) (rate(gpustack:lb_requests_total{job=\"$app_name\"}[5m]))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{request_class}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Доля short/medium/heavy запросов во времени. Определяет scoring weights балансировщика.",
-        "id": 2,
-        "links": [],
-        "title": "Request Classification",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 20,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "reqps"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "multi",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-3": {
+    "panel-18": {
       "kind": "Panel",
       "spec": {
         "data": {
@@ -1207,7 +1212,7 @@
           }
         },
         "description": "Накладные расходы балансировщика. Время select_instance() в секундах.",
-        "id": 3,
+        "id": 18,
         "links": [],
         "title": "Selection Latency",
         "vizConfig": {
@@ -1290,6 +1295,606 @@
         }
       }
     },
+    "panel-19": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_instance_slow_start_weight{job=\"$app_name\"}",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Slow start вес по инстансам. 0 = активен, 1 = полностью idle. Показывает warm-up после простоя.",
+        "id": 19,
+        "links": [],
+        "title": "Slow Start Weight",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "none"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "single",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-2": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (request_class, model_name) (rate(gpustack:lb_requests_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{request_class}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Доля short/medium/heavy запросов во времени. Определяет scoring weights балансировщика.",
+        "id": 2,
+        "links": [],
+        "title": "Request Classification",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 20,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "multi",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-20": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * 60 * on (model_name) group_left() (avg by (model_name) (rate(gpustack:lb_request_max_tokens_sum{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Суммарная пропускная способность по генерации токенов (max_tokens) по каждой реплике в минуту.",
+        "id": 20,
+        "links": [],
+        "title": "Generation Tokens per Replica",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 20,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "multi",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-21": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (instance_id, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * 60 * on (model_name) group_left() (avg by (model_name) (rate(gpustack:lb_request_prompt_tokens_sum{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Суммарная input context способность (prompt_tokens) по каждой реплике в минуту.",
+        "id": 21,
+        "links": [],
+        "title": "Input Context per Replica",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 20,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "multi",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-3": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum(rate(gpustack:lb_request_total_tokens_sum{job=\"$app_name\"}[5m])) * 60",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Среднее количество токенов в минуту (prompt + max_tokens). Показывает общую вычислительную нагрузку.",
+        "id": 3,
+        "links": [],
+        "title": "Token Throughput",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "none"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "single",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
     "panel-4": {
       "kind": "Panel",
       "spec": {
@@ -1310,7 +1915,199 @@
                     "spec": {
                       "editorMode": "code",
                       "exemplar": true,
-                      "expr": "sum by (reason, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m]))",
+                      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "p50",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "p90",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "B"
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "p95",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "C"
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(gpustack:lb_request_prompt_tokens_bucket{job=\"$app_name\"}[5m])))",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "p99",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "D"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Распределение размера prompt в токенах. Показывает реальный профиль KV-нагрузки.",
+        "id": 4,
+        "links": [],
+        "title": "Prompt Tokens (percentiles)",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "none"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "single",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-5": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (reason, model_name) (rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * 60",
                       "instant": false,
                       "interval": "",
                       "legendFormat": "{{reason}}",
@@ -1327,7 +2124,7 @@
           }
         },
         "description": "Соотношение affinity_soft vs pot_score в lb_selections_total. Показывает, насколько часто affinity срабатывает.",
-        "id": 4,
+        "id": 5,
         "links": [],
         "title": "Affinity Efficiency",
         "vizConfig": {
@@ -1386,7 +2183,7 @@
                     }
                   ]
                 },
-                "unit": "reqps"
+                "unit": "rpm"
               },
               "overrides": []
             },
@@ -1410,7 +2207,98 @@
         }
       }
     },
-    "panel-5": {
+    "panel-6": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum(rate(gpustack:lb_selections_total{job=\"$app_name\",reason=\"affinity_soft\"}[5m])) / sum(rate(gpustack:lb_selections_total{job=\"$app_name\"}[5m])) * 100",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Процент запросов, обслуженных через affinity (affinity_soft / все селекции). Высокое значение означает, что сессии стабильно прилипают к репликам.",
+        "id": 6,
+        "links": [],
+        "title": "Affinity Hit Rate (%)",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "max": 100,
+                "min": 0,
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": 0
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 30
+                    },
+                    {
+                      "color": "green",
+                      "value": 60
+                    }
+                  ]
+                },
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-7": {
       "kind": "Panel",
       "spec": {
         "data": {
@@ -1447,215 +2335,9 @@
           }
         },
         "description": "Текущий streak последовательных affinity-хитов по инстансам. Не монополизирует ли одна сессия реплику.",
-        "id": 5,
-        "links": [],
-        "title": "Affinity Streak",
-        "vizConfig": {
-          "group": "bargauge",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "continuous-GrYlRd"
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            },
-            "options": {
-              "displayMode": "gradient",
-              "minVizHeight": 10,
-              "minVizWidth": 0,
-              "orientation": "horizontal",
-              "reduceOptions": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "fields": "",
-                "values": false
-              },
-              "showUnfilled": true,
-              "valueMode": "color"
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-6": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "sum by (model_name) (rate(gpustack:lb_affinity_streak_resets_total{job=\"$app_name\"}[5m]))",
-                      "instant": false,
-                      "interval": "",
-                      "legendFormat": "{{model_name}}",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Частота принудительного сброса affinity streak (cap exceeded). Показывает, как часто срабатывает лимит.",
-        "id": 6,
-        "links": [],
-        "title": "Streak Resets",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "axisBorderShow": false,
-                  "axisCenteredZero": false,
-                  "axisColorMode": "text",
-                  "axisLabel": "",
-                  "axisPlacement": "auto",
-                  "barAlignment": 0,
-                  "barWidthFactor": 0.6,
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "gradientMode": "none",
-                  "hideFrom": {
-                    "legend": false,
-                    "tooltip": false,
-                    "viz": false
-                  },
-                  "insertNulls": false,
-                  "lineInterpolation": "linear",
-                  "lineWidth": 1,
-                  "pointSize": 5,
-                  "scaleDistribution": {
-                    "type": "linear"
-                  },
-                  "showPoints": "auto",
-                  "showValues": false,
-                  "spanNulls": false,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "none"
-                  },
-                  "thresholdsStyle": {
-                    "mode": "off"
-                  }
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "ops"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [],
-                "displayMode": "list",
-                "enableFacetedFilter": false,
-                "overflow": "ellipsis",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "hideZeros": false,
-                "mode": "single",
-                "sort": "none"
-              }
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
-    },
-    "panel-7": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "gpustack:lb_instance_score{job=\"$app_name\"}",
-                      "instant": true,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": false
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Текущий score по инстансам. Насколько равномерно распределяется нагрузка (ниже score — лучше).",
         "id": 7,
         "links": [],
-        "title": "Instance Score",
+        "title": "Affinity Streak",
         "vizConfig": {
           "group": "bargauge",
           "kind": "VizConfig",
@@ -1722,7 +2404,127 @@
                     "spec": {
                       "editorMode": "code",
                       "exemplar": true,
-                      "expr": "gpustack:lb_instance_ewma_kv{job=\"$app_name\"}",
+                      "expr": "sum by (model_name) (rate(gpustack:lb_affinity_streak_resets_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{model_name}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Частота принудительного сброса affinity streak (cap exceeded). Показывает, как часто срабатывает лимит.",
+        "id": 8,
+        "links": [],
+        "title": "Streak Resets",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "none"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "single",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-9": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_request_kv_cache_usage{job=\"$app_name\"}",
                       "instant": true,
                       "interval": "",
                       "legendFormat": "{{instance_id}}",
@@ -1738,10 +2540,10 @@
             "transformations": []
           }
         },
-        "description": "Сглаженное использование KV cache (Peak EWMA) по инстансам. Показывает реальную KV-нагрузку.",
-        "id": 8,
+        "description": "Текущее использование KV cache (raw, без сглаживания) по инстансам. Показывает мгновенную нагрузку на VRAM.",
+        "id": 9,
         "links": [],
-        "title": "EWMA KV Cache",
+        "title": "KV Cache Usage (raw)",
         "vizConfig": {
           "group": "bargauge",
           "kind": "VizConfig",
@@ -1787,92 +2589,6 @@
           "version": "13.1.0"
         }
       }
-    },
-    "panel-9": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "${DS_PROMETHEUS}"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "exemplar": true,
-                      "expr": "gpustack:lb_instance_wlc_weight{job=\"$app_name\"}",
-                      "instant": true,
-                      "interval": "",
-                      "legendFormat": "{{instance_id}}",
-                      "range": false
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Weighted Least Connections вес по инстансам. Сумма весов активных соединений (prompt + max_tokens).",
-        "id": 9,
-        "links": [],
-        "title": "WLC Weight",
-        "vizConfig": {
-          "group": "bargauge",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "continuous-GrYlRd"
-                },
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "red",
-                      "value": 80
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            },
-            "options": {
-              "displayMode": "gradient",
-              "minVizHeight": 10,
-              "minVizWidth": 0,
-              "orientation": "horizontal",
-              "reduceOptions": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "fields": "",
-                "values": false
-              },
-              "showUnfilled": true,
-              "valueMode": "color"
-            }
-          },
-          "version": "13.1.0"
-        }
-      }
     }
   },
   "layout": {
@@ -1886,7 +2602,7 @@
               "kind": "ElementReference",
               "name": "panel-100"
             },
-            "height": 15,
+            "height": 6,
             "width": 24,
             "x": 0,
             "y": 0
@@ -1897,12 +2613,25 @@
           "spec": {
             "element": {
               "kind": "ElementReference",
+              "name": "panel-101"
+            },
+            "height": 10,
+            "width": 24,
+            "x": 0,
+            "y": 6
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
               "name": "panel-1"
             },
             "height": 8,
-            "width": 8,
+            "width": 6,
             "x": 0,
-            "y": 15
+            "y": 16
           }
         },
         {
@@ -1913,9 +2642,9 @@
               "name": "panel-2"
             },
             "height": 8,
-            "width": 8,
-            "x": 8,
-            "y": 15
+            "width": 6,
+            "x": 6,
+            "y": 16
           }
         },
         {
@@ -1926,9 +2655,9 @@
               "name": "panel-3"
             },
             "height": 8,
-            "width": 8,
-            "x": 16,
-            "y": 15
+            "width": 6,
+            "x": 12,
+            "y": 16
           }
         },
         {
@@ -1939,9 +2668,22 @@
               "name": "panel-4"
             },
             "height": 8,
-            "width": 8,
+            "width": 6,
+            "x": 18,
+            "y": 16
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-102"
+            },
+            "height": 10,
+            "width": 24,
             "x": 0,
-            "y": 23
+            "y": 24
           }
         },
         {
@@ -1953,8 +2695,8 @@
             },
             "height": 8,
             "width": 8,
-            "x": 8,
-            "y": 23
+            "x": 0,
+            "y": 34
           }
         },
         {
@@ -1965,22 +2707,9 @@
               "name": "panel-6"
             },
             "height": 8,
-            "width": 8,
-            "x": 16,
-            "y": 23
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-7"
-            },
-            "height": 8,
-            "width": 8,
-            "x": 0,
-            "y": 31
+            "width": 4,
+            "x": 8,
+            "y": 34
           }
         },
         {
@@ -1991,9 +2720,22 @@
               "name": "panel-8"
             },
             "height": 8,
-            "width": 8,
-            "x": 8,
-            "y": 31
+            "width": 6,
+            "x": 12,
+            "y": 34
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-7"
+            },
+            "height": 8,
+            "width": 6,
+            "x": 18,
+            "y": 34
           }
         },
         {
@@ -2005,8 +2747,8 @@
             },
             "height": 8,
             "width": 8,
-            "x": 16,
-            "y": 31
+            "x": 0,
+            "y": 42
           }
         },
         {
@@ -2017,9 +2759,9 @@
               "name": "panel-10"
             },
             "height": 8,
-            "width": 12,
-            "x": 0,
-            "y": 39
+            "width": 8,
+            "x": 8,
+            "y": 42
           }
         },
         {
@@ -2030,9 +2772,22 @@
               "name": "panel-11"
             },
             "height": 8,
-            "width": 6,
-            "x": 12,
-            "y": 39
+            "width": 4,
+            "x": 16,
+            "y": 42
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-103"
+            },
+            "height": 10,
+            "width": 24,
+            "x": 0,
+            "y": 50
           }
         },
         {
@@ -2043,22 +2798,9 @@
               "name": "panel-12"
             },
             "height": 8,
-            "width": 6,
-            "x": 18,
-            "y": 39
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-13"
-            },
-            "height": 8,
             "width": 8,
             "x": 0,
-            "y": 47
+            "y": 60
           }
         },
         {
@@ -2071,7 +2813,46 @@
             "height": 8,
             "width": 8,
             "x": 8,
-            "y": 47
+            "y": 60
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-17"
+            },
+            "height": 8,
+            "width": 4,
+            "x": 16,
+            "y": 60
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-13"
+            },
+            "height": 8,
+            "width": 6,
+            "x": 0,
+            "y": 68
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-16"
+            },
+            "height": 8,
+            "width": 6,
+            "x": 6,
+            "y": 68
           }
         },
         {
@@ -2082,9 +2863,74 @@
               "name": "panel-15"
             },
             "height": 8,
+            "width": 4,
+            "x": 12,
+            "y": 68
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-104"
+            },
+            "height": 10,
+            "width": 24,
+            "x": 0,
+            "y": 76
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-18"
+            },
+            "height": 8,
             "width": 8,
+            "x": 0,
+            "y": 86
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-19"
+            },
+            "height": 8,
+            "width": 8,
+            "x": 8,
+            "y": 86
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-20"
+            },
+            "height": 8,
+            "width": 4,
             "x": 16,
-            "y": 47
+            "y": 86
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-21"
+            },
+            "height": 8,
+            "width": 4,
+            "x": 20,
+            "y": 86
           }
         }
       ]
@@ -2099,11 +2945,8 @@
     "smart-lb"
   ],
   "timeSettings": {
-    "autoRefresh": "30s",
+    "autoRefresh": "1m",
     "autoRefreshIntervals": [
-      "5s",
-      "10s",
-      "30s",
       "1m",
       "5m",
       "15m",
@@ -2116,7 +2959,7 @@
     "from": "now-3h",
     "hideTimepicker": false,
     "timezone": "browser",
-    "to": "now"
+    "to": "now-1m"
   },
   "title": "GPUStack. Smart Load Balancer",
   "uid": "gpustack-smart-lb",
@@ -2212,5 +3055,5 @@
       }
     }
   ],
-  "version": 3
+  "version": 9
 }
