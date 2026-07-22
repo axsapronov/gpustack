@@ -4,6 +4,11 @@ import os
 
 # Database configuration
 DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
+# Diagnostic: when non-empty, every executed SQL whose text contains this
+# substring gets its Python call stack logged once per distinct call site
+# (deduplicated), so a high-frequency query can be attributed to its caller
+# without drowning the log. Empty (default) disables the check entirely.
+DB_TRACE_SQL_SUBSTR = os.getenv("GPUSTACK_DB_TRACE_SQL_SUBSTR", "")
 DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 30))
 DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 20))
 DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
@@ -68,6 +73,16 @@ WORKER_UNREACHABLE_CHECK_MODE = os.getenv(
     "GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE", "auto"
 ).lower()
 
+# Opt-in (default off): drop a runner image's bundled cuda-compat and use the host
+# driver so consumer GPUs can run images built for a newer CUDA minor (same major).
+# Overridable per-model via the same env name in the model's env.
+ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV = (
+    "GPUSTACK_ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY"
+)
+ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY = os.getenv(
+    ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV, "false"
+).lower() in ["true", "1"]
+
 # GPU instance configuration
 # Interval at which the controller re-observes a still-transitioning (non-
 # settled) GPU instance via an in-memory requeue, instead of writing its own
@@ -95,6 +110,16 @@ MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD = int(
 )  # 5 minutes in seconds
 MODEL_INSTANCE_HEALTH_CHECK_INTERVAL = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_HEALTH_CHECK_INTERVAL", 3)
+)
+# Period, in seconds, for forcing an authoritative (uncached) DB reconciliation
+# of locally-tracked model instances in the worker state sync. 0 disables it,
+# leaving the sync purely cache-backed. It exists only as a backstop for a
+# watch cache that silently diverged from DB truth without a reconnect (e.g. a
+# coordinator dropping a DELETED on a live stream); enabling it reintroduces one
+# uncached full SELECT per worker per period, so keep it well above the health
+# check interval when set.
+MODEL_INSTANCE_STATE_RECONCILE_INTERVAL = int(
+    os.getenv("GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL", 0)
 )
 DISABLE_OS_FILELOCK = os.getenv("GPUSTACK_DISABLE_OS_FILELOCK", "false").lower() in [
     "true",
@@ -176,13 +201,26 @@ USAGE_ESTIMATED_TOKENS_PER_OUTPUT_CHUNK = max(
     1, int(os.getenv("GPUSTACK_USAGE_ESTIMATED_TOKENS_PER_OUTPUT_CHUNK", 1))
 )
 
-# Timezone used to bucket the ``model_usages.date`` daily rollup (and the
-# matching ``model_usage_details.date`` audit column). Empty (default) ⇒ use
-# the operating system's local timezone (resolved from ``TZ`` env var /
-# ``/etc/localtime``). Set to an IANA name (``Asia/Shanghai``, ``UTC``, ...)
-# to override — useful when the server container runs in UTC but operators
-# expect rollups to follow a different region's calendar day.
-USAGE_ROLLUP_TIMEZONE = os.getenv("GPUSTACK_USAGE_ROLLUP_TIMEZONE", "")
+# Platform-wide timezone for calendar-based rollups and time-of-day display.
+# It buckets the ``model_usages.date`` daily rollup (and the matching
+# ``model_usage_details.date`` audit column), the ``metered_usage`` GPU/storage
+# time buckets, and renders Last Active / resource-event times — and is the
+# canonical calendar for any other feature that needs an operator-chosen
+# timezone. Empty (default) ⇒ use the operating system's local timezone
+# (resolved from ``TZ`` env var / ``/etc/localtime``). Set to an IANA name
+# (``Asia/Shanghai``, ``UTC``, ...) to override — useful when the server
+# container runs in UTC but operators expect a different region's calendar.
+#
+# ``GPUSTACK_USAGE_ROLLUP_TIMEZONE`` is the pre-rename name, kept as a
+# deprecated alias: ``GPUSTACK_TIMEZONE`` wins when both are set; otherwise the
+# legacy value is honored. ``USING_DEPRECATED_TIMEZONE`` records that the value
+# came from the legacy var so ``resolve_rollup_tz`` can emit a one-time
+# deprecation warning — deferred out of import time, since this module loads
+# before logging is configured (logging here is a Python anti-pattern).
+_timezone = os.getenv("GPUSTACK_TIMEZONE", "")
+_legacy_rollup_timezone = os.getenv("GPUSTACK_USAGE_ROLLUP_TIMEZONE", "")
+USING_DEPRECATED_TIMEZONE = bool(_legacy_rollup_timezone and not _timezone)
+TIMEZONE = _timezone or _legacy_rollup_timezone
 
 # Usage details archival.
 # Rows in ``model_usage_details`` older than the retention threshold (anchored

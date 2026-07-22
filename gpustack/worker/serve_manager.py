@@ -176,6 +176,11 @@ class ServeManager:
         # Track last health check time per model instance
         self._last_health_check_time: Dict[int, float] = {}
 
+        # Timestamp of the last authoritative (uncached) DB reconciliation in
+        # the state sync, for the optional periodic backstop. Starts "now" so
+        # the first forced reconciliation is one full period in, not immediate.
+        self._last_state_reconcile_time: float = time.time()
+
         os.makedirs(self._serve_log_dir, exist_ok=True)
 
     def record_successful_inference(self, instance_id: int):
@@ -247,10 +252,6 @@ class ServeManager:
         - If everything is fine, update the model instance state to RUNNING.
         """
 
-        # Get all model instances assigned to this worker.
-        #
-        # FIXME(thxCode): This may cause performance issues when there are many model instances in the system.
-        #                 A mechanism is needed to improve efficiency here.
         # Snapshot local state BEFORE the list call. Reversing this order
         # races with CREATED events and reaps freshly-assigned instances.
         local_assigned_ids = {
@@ -259,26 +260,65 @@ class ServeManager:
             if mi.get_deployment_metadata(self._worker_id) is not None
         }
 
-        # page=-1 returns all rows — needed because the default perPage=100
-        # would have the reap below missing workloads on page 2+.
-        response = self._clientset.model_instances.list(
-            params={"page": -1},
-            use_cache=False,
-        )
+        # Read from the watch-backed cache. It holds the full set, so the
+        # common (nothing-to-reap) path stays O(1) with no server/DB round
+        # trip and scales independently of worker count — a direct per-worker
+        # poll here is one SELECT over model_instances per worker every few
+        # seconds, which does not scale to hundreds of workers.
+        response = self._clientset.model_instances.list()
         all_items = response.items or []
-
-        # Reap entries the server no longer reports — watch streams can drop
-        # DELETED events on disconnect, and when the user stops every model
-        # the server legitimately reports zero instances. list() raises on
-        # API failure rather than returning empty, so an empty result is
-        # authoritative — local_assigned_ids - ∅ = local_assigned_ids and
-        # everything still tracked locally is correctly reaped.
-        authoritative_ids: Set[int] = {
+        reap_ids = local_assigned_ids - {
             mi.id
             for mi in all_items
             if mi.get_deployment_metadata(self._worker_id) is not None
         }
-        for stale_id in local_assigned_ids - authoritative_ids:
+
+        # Optional periodic reconciliation against DB truth even when the cache
+        # reports nothing reapable. The cache and local serving state are both
+        # fed by the same awatch stream, so a ghost re-seeded into the cache
+        # sits in both and `local - cache` never flags it; an independent DB
+        # read is the only thing that catches that. Disabled by default (the
+        # server-side cached_all fix plus reconnect-driven reaping cover the
+        # realistic cases); opt in via the
+        # GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL env var when a
+        # coordinator may drop DELETEDs on a live stream.
+        reconcile_interval = envs.MODEL_INSTANCE_STATE_RECONCILE_INTERVAL
+        now = time.time()
+        force_authoritative = (
+            reconcile_interval > 0
+            and now - self._last_state_reconcile_time >= reconcile_interval
+        )
+
+        # Reaping tears down live workloads, so it must act on an authoritative
+        # snapshot. The cache is not one at every instant: awatch clears it and
+        # flips _watch_started before the replay snapshot arrives, so a read
+        # during a reconnect window can see an empty-but-"authoritative" cache
+        # and surface healthy instances as stale. So confirm reap candidates
+        # against a fresh, unpaginated, uncached fetch — this only touches the
+        # DB when something looks reapable or on the periodic reconciliation.
+        if reap_ids or force_authoritative:
+            response = self._clientset.model_instances.list(
+                params={"page": -1},
+                use_cache=False,
+            )
+            # Any successful authoritative fetch counts as a reconciliation —
+            # whether triggered by the timer or by a reap candidate — so reset
+            # the timer here (list() raises on API failure, so a failed fetch
+            # doesn't advance it and the next tick retries). Skipped when the
+            # backstop is disabled to keep the timestamp meaningless-but-inert.
+            if reconcile_interval > 0:
+                self._last_state_reconcile_time = now
+            all_items = response.items or []
+            reap_ids = local_assigned_ids - {
+                mi.id
+                for mi in all_items
+                if mi.get_deployment_metadata(self._worker_id) is not None
+            }
+
+        # An empty authoritative result is legitimate (user stopped every
+        # model); list() raises on API failure rather than returning empty, so
+        # local_assigned_ids - ∅ correctly reaps everything still tracked.
+        for stale_id in reap_ids:
             stale = self._model_instance_by_instance_id.get(stale_id)
             if stale is None:
                 continue
@@ -680,7 +720,23 @@ class ServeManager:
                 # Reset failure count on success.
                 self._inference_health_check_failures.pop(model_instance.id, None)
 
-    def _handle_model_instance_event(self, event: Event):  # noqa: C901
+    def _handle_model_instance_event(self, event: Event):
+        """Handle a model instance event without ever crashing the watch stream.
+
+        The awatch callback runs inline in the watch loop, so any exception
+        that escapes here tears the stream down and forces a full reconnect
+        plus cache reload. Swallow and log (with traceback) instead; the next
+        event or the periodic state sync recovers the instance.
+        """
+        try:
+            self._dispatch_model_instance_event(event)
+        except Exception:
+            logger.exception(
+                f"Failed to handle {event.type} event for model instance "
+                f"{getattr(event, 'id', None)}"
+            )
+
+    def _dispatch_model_instance_event(self, event: Event):  # noqa: C901
         """
         Handle model instance events.
 
@@ -764,8 +820,15 @@ class ServeManager:
                     return
 
         if event.type == EventType.DELETED:
-            self._stop_model_instance(mi, delete_logs=True)
-            logger.trace(f"DELETED event: stopped deleted model instance {mi.name}.")
+            # Teardown is left to the periodic reap in sync_model_instances_state,
+            # which is the authoritative reconciler and must run anyway to catch
+            # DELETEDs missed during a watch disconnect. Tearing down here too
+            # would give a second concurrent caller racing the reap on
+            # delete_workload, so just let the reap reap it (within one tick).
+            logger.trace(
+                f"DELETED event for model instance {mi.name}; "
+                "teardown deferred to reap."
+            )
             return
 
         if event.type == EventType.UPDATED:

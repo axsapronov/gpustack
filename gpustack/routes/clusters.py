@@ -83,21 +83,20 @@ router = APIRouter()
 def get_server_url(request: Request, cluster_override: Optional[str]) -> str:
     """Resolve the worker-facing server URL.
 
-    Never derive it from the (client-controllable) request Host: a forged
-    X-Forwarded-Host would otherwise point new workers at an attacker. Prefer
-    the cluster override, then server_external_url, then the server's own
-    advertised address.
+    Priority:
+    1. cluster override
+    2. server_external_url
+    3. request host (scheme + netloc). ForwardedHostPortMiddleware only gates
+       X-Forwarded-Host rewriting by trusted_hosts; a directly supplied Host
+       header still flows into request.url, so this is not full host-injection
+       protection unless the server is reachable only via a trusted proxy.
     """
     if cluster_override:
         return cluster_override.rstrip("/")
     cfg = get_global_config()
-    url = cfg.server_external_url
+    url = cfg.server_external_url if cfg else None
     if not url:
-        scheme = "https" if (cfg.ssl_certfile and cfg.ssl_keyfile) else "http"
-        address = cfg.get_advertise_address()
-        if ":" in address and not address.startswith("["):
-            address = f"[{address}]"  # bracket IPv6 literals
-        url = f"{scheme}://{address}:{cfg.api_port}"
+        url = f"{request.url.scheme}://{request.url.netloc}"
     return url.rstrip("/")
 
 
@@ -737,6 +736,7 @@ async def get_registration_token(
 async def get_cluster_manifests(
     request: Request,
     session: SessionDep,
+    ctx: TenantContextDep,
     id: int,
     runtime: Optional[List[ManufacturerEnum]] = Query(
         None,
@@ -751,6 +751,9 @@ async def get_cluster_manifests(
     cluster = await Cluster.one_by_id(session, id)
     if not cluster or cluster.deleted_at is not None:
         raise NotFoundException(message=f"cluster {id} not found")
+    # The manifest embeds the cluster registration token, a write-class
+    # secret — gate it the same way as the registration-token endpoint.
+    assert_cluster_writable(ctx, cluster)
     if cluster.provider != ClusterProvider.Kubernetes:
         raise InvalidException(
             message=f"Cannot get manifests for cluster {cluster.name}(id: {id}) with provider {cluster.provider}"
@@ -858,6 +861,7 @@ _CLUSTER_PROXY_REQUEST_HEADER_SKIP = {
 )
 async def cluster_apiserver_proxy(
     request: Request,
+    ctx: TenantContextDep,
     id: int,
     path: str,
 ):
@@ -874,6 +878,9 @@ async def cluster_apiserver_proxy(
         cluster = await Cluster.one_by_id(session, id)
         if not cluster or cluster.deleted_at is not None:
             raise NotFoundException(message=f"cluster {id} not found")
+        assert_cluster_visible(
+            ctx, cluster, not_found_message=f"cluster {id} not found"
+        )
         if cluster.provider != ClusterProvider.Kubernetes:
             raise InvalidException(
                 message=(
