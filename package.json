@@ -1,0 +1,17 @@
+{
+  "name": "gpustack",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dashboard:generate": "node docker-compose/grafana/grafana_dashboards/scripts/generate-dashboard.mjs",
+    "dashboard:validate": "node docker-compose/grafana/grafana_dashboards/scripts/validate-dashboard.mjs",
+    "dashboard:test": "node --test docker-compose/grafana/grafana_dashboards/scripts/dashboard.test.mjs",
+    "dashboards": "npm run dashboard:generate && npm run dashboard:validate && npm run dashboard:test"
+  },
+  "devDependencies": {
+    "@grafana/openapi": "13.1.0",
+    "@hanazuki/node-jsonnet": "3.3.1",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}

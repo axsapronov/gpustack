@@ -58,5 +58,34 @@ help:
 	#
 	@echo
 
+
+
+GRAFANA_MONITORING_DIR := deploy/monitoring
+GRAFANA_DASHBOARD_JSONS := \
+	$(GRAFANA_MONITORING_DIR)/gpustack-lb.json
+GRAFANA_DASHBOARD_JSONNETS := \
+	$(GRAFANA_MONITORING_DIR)/gpustack-lb.jsonnet
+GRAFANA_SCRIPTS := $(GRAFANA_MONITORING_DIR)/scripts
+NODE_MODULES_STAMP := node_modules/.install-stamp
+DASHBOARDS_STAMP := $(GRAFANA_MONITORING_DIR)/.dashboards.stamp
+
+install-dashboards: $(NODE_MODULES_STAMP)
+
+$(NODE_MODULES_STAMP): package.json package-lock.json
+	npm ci
+	@touch $(NODE_MODULES_STAMP)
+
+dashboards: install-dashboards $(GRAFANA_DASHBOARD_JSONS) validate-dashboard
+
+$(DASHBOARDS_STAMP): $(GRAFANA_DASHBOARD_JSONNETS) package.json package-lock.json $(GRAFANA_SCRIPTS)/*.mjs $(NODE_MODULES_STAMP)
+	npm run dashboard:generate
+	@touch $(DASHBOARDS_STAMP)
+
+$(GRAFANA_DASHBOARD_JSONS): $(DASHBOARDS_STAMP)
+	@:
+
+validate-dashboard: $(GRAFANA_DASHBOARD_JSONS) install-dashboards
+	npm run dashboard:validate && npm run dashboard:test
+
 .DEFAULT_GOAL := build
 .PHONY: $(targets)

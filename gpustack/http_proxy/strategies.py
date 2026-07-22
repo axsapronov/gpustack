@@ -301,6 +301,19 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
         if not healthy:
             raise RuntimeError("No healthy instances available")
 
+        # Record pool size metric
+        try:
+            from gpustack.http_proxy.lb_metrics import get_lb_metrics_collector
+
+            collector = get_lb_metrics_collector()
+            collector.record_pool_size(
+                model_id=str(healthy[0].model_id),
+                model_name=healthy[0].model_name,
+                size=len(healthy),
+            )
+        except Exception:
+            pass
+
         # Step 2: Update states — EWMA, WLC decay, slow start ramp
         for inst in healthy:
             m = get_metrics(inst.id)
@@ -361,6 +374,20 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                             envs.LB_AFFINITY_MAX_STREAK,
                         )
                         self._affinity_streak[pinned_id] = 0
+                        # Record streak reset metric
+                        try:
+                            from gpustack.http_proxy.lb_metrics import (
+                                get_lb_metrics_collector,
+                            )
+
+                            collector = get_lb_metrics_collector()
+                            collector.record_streak_reset(
+                                model_id=str(pinned.model_id),
+                                model_name=pinned.model_name,
+                                instance_id=str(pinned_id),
+                            )
+                        except Exception:
+                            pass
                     else:
                         pinned_instance = pinned
 
@@ -384,6 +411,20 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
                             envs.LB_AFFINITY_MAX_STREAK,
                         )
                         self._affinity_streak[pinned_id] = 0
+                        # Record streak reset metric
+                        try:
+                            from gpustack.http_proxy.lb_metrics import (
+                                get_lb_metrics_collector,
+                            )
+
+                            collector = get_lb_metrics_collector()
+                            collector.record_streak_reset(
+                                model_id=str(pinned.model_id),
+                                model_name=pinned.model_name,
+                                instance_id=str(pinned_id),
+                            )
+                        except Exception:
+                            pass
                     else:
                         pinned_instance = pinned
 

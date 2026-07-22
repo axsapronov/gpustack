@@ -174,3 +174,5 @@ charts/gpustack-chart/charts/
 # avoid ignoring var in rootfs
 !/pack/rootfs/var
 !/pack/rootfs/var/**
+
+node_modules/
