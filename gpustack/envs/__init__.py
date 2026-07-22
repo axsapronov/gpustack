@@ -342,9 +342,15 @@ LB_TOTAL_MEDIUM_THRESHOLD = int(
     os.getenv("GPUSTACK_LB_TOTAL_MEDIUM_THRESHOLD", "20000")
 )
 
-# Power of Two Choices (PoT) scoring
-# KV usage coefficient in the PoT score: score = running + waiting + alpha * kv
-LB_POT_ALPHA = float(os.getenv("GPUSTACK_LB_POT_ALPHA", "2.5"))
+# Scoring weights per request class
+# Waiting weight multiplier in score formula
+LB_WAITING_WEIGHT_SHORT = float(os.getenv("GPUSTACK_LB_WAITING_WEIGHT_SHORT", "1.0"))
+LB_WAITING_WEIGHT_MEDIUM = float(os.getenv("GPUSTACK_LB_WAITING_WEIGHT_MEDIUM", "2.0"))
+LB_WAITING_WEIGHT_HEAVY = float(os.getenv("GPUSTACK_LB_WAITING_WEIGHT_HEAVY", "4.0"))
+# KV weight multiplier in score formula
+LB_KV_WEIGHT_SHORT = float(os.getenv("GPUSTACK_LB_KV_WEIGHT_SHORT", "1.0"))
+LB_KV_WEIGHT_MEDIUM = float(os.getenv("GPUSTACK_LB_KV_WEIGHT_MEDIUM", "2.0"))
+LB_KV_WEIGHT_HEAVY = float(os.getenv("GPUSTACK_LB_KV_WEIGHT_HEAVY", "3.0"))
 
 # Peak EWMA — exponentially weighted moving average for KV cache smoothing
 # alpha when load is rising (fast reaction to overload)
@@ -352,32 +358,19 @@ LB_EWMA_ALPHA_RISE = float(os.getenv("GPUSTACK_LB_EWMA_ALPHA_RISE", "0.7"))
 # alpha when load is falling (slow decay, remembers overload)
 LB_EWMA_ALPHA_FALL = float(os.getenv("GPUSTACK_LB_EWMA_ALPHA_FALL", "0.3"))
 
-# Consistent Hashing with Bounded Loads (CHWBL)
-# Number of virtual nodes per instance on the hash ring
-LB_CHWBL_VNODES = int(os.getenv("GPUSTACK_LB_CHWBL_VNODES", "100"))
-# Overload factor: if inflight > avg * factor, skip to next node on ring
-LB_CHWBL_OVERLOAD_FACTOR = float(os.getenv("GPUSTACK_LB_CHWBL_OVERLOAD_FACTOR", "1.5"))
-
-# Circuit Breaker
-# Timeout in seconds before transitioning from OPEN to HALF-OPEN
-LB_CIRCUIT_BREAKER_TIMEOUT = float(
-    os.getenv("GPUSTACK_LB_CIRCUIT_BREAKER_TIMEOUT", "9.0")
-)
-# KV threshold to trip the circuit breaker (instance goes OPEN)
-LB_CIRCUIT_BREAKER_KV_THRESHOLD = float(
-    os.getenv("GPUSTACK_LB_CIRCUIT_BREAKER_KV_THRESHOLD", "0.85")
-)
-
-# Slow Start — gradually increase traffic weight after idle period
+# Slow Start — gradually increase traffic weight after idle period (linear ramp)
 # Window in seconds for the slow-start ramp-up
-LB_SLOW_START_WINDOW = float(os.getenv("GPUSTACK_LB_SLOW_START_WINDOW", "15.0"))
-# Aggression: 1.0 = linear ramp, 2.0 = convex (faster early), 0.5 = concave
-LB_SLOW_START_AGGRESSION = float(os.getenv("GPUSTACK_LB_SLOW_START_AGGRESSION", "1.0"))
-
-# Session affinity bonus (used in PoT scoring when session is pinned)
-LB_AFFINITY_SESSION_BONUS = float(
-    os.getenv("GPUSTACK_LB_AFFINITY_SESSION_BONUS", "4.0")
+LB_SLOW_START_RAMP_SECONDS = float(
+    os.getenv("GPUSTACK_LB_SLOW_START_RAMP_SECONDS", "15.0")
 )
+
+# Affinity configuration
+# Affinity break multiplier: break if score(pinned) > score(best) * this ratio
+LB_AFFINITY_BREAK_MULTIPLIER = float(
+    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER", "1.2")
+)
+# Max consecutive affinity hits before forced reset (prevents monopolization)
+LB_AFFINITY_MAX_STREAK = int(os.getenv("GPUSTACK_LB_AFFINITY_MAX_STREAK", "20"))
 
 # Feature flags for affinity types
 LB_ENABLE_SESSION_AFFINITY = str(
@@ -386,30 +379,3 @@ LB_ENABLE_SESSION_AFFINITY = str(
 LB_ENABLE_PREFIX_AFFINITY = str(
     os.getenv("GPUSTACK_LB_ENABLE_PREFIX_AFFINITY", "true")
 ).lower() in ("true", "1", "yes")
-
-# Cluster imbalance detection thresholds
-# Cluster is imbalanced if max(queue_len) - min(queue_len) >= this value
-LB_IMBALANCED_QUEUE_THRESHOLD = int(
-    os.getenv("GPUSTACK_LB_IMBALANCED_QUEUE_THRESHOLD", "2")
-)
-# Cluster is imbalanced if max(kv) - min(kv) >= this value
-LB_IMBALANCED_KV_THRESHOLD = float(
-    os.getenv("GPUSTACK_LB_IMBALANCED_KV_THRESHOLD", "0.20")
-)
-
-# Affinity breaker thresholds
-# Break affinity if score(pinned) > score(best) * this ratio
-LB_AFFINITY_BREAK_SCORE_RATIO = float(
-    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_SCORE_RATIO", "1.10")
-)
-# Break affinity if running_pinned > min_running + this delta
-LB_AFFINITY_BREAK_RUNNING_DELTA = int(
-    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_RUNNING_DELTA", "1")
-)
-# Break affinity if kv_pinned > min_kv + this delta
-LB_AFFINITY_BREAK_KV_DELTA = float(
-    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_KV_DELTA", "0.15")
-)
-
-# Power of Two Choices: number of random candidates to sample
-LB_POT_CHOICE_COUNT = int(os.getenv("GPUSTACK_LB_POT_CHOICE_COUNT", "2"))

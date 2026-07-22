@@ -16,8 +16,9 @@ services:
       - ./gpustack/logging.py:/usr/local/lib/python3.11/dist-packages/gpustack/logging.py
       - ./gpustack/config/config.py:/usr/local/lib/python3.11/dist-packages/gpustack/config/config.py
       - ./gpustack/api/middlewares.py:/usr/local/lib/python3.11/dist-packages/gpustack/api/middlewares.py
+      - ./gpustack/exporter/exporter.py:/usr/local/lib/python3.11/dist-packages/gpustack/exporter/exporter.py
+      - ./gpustack/http_proxy/lb_metrics.py:/usr/local/lib/python3.11/dist-packages/gpustack/http_proxy/lb_metrics.py
     command: --database-url ${GPUSTACK_DATABASE_URL} --disable-worker --server-external-url http://192.168.0.45
-    # command: --disable-worker
     env_file:
       - .env
     healthcheck:

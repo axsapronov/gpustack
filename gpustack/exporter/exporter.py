@@ -9,6 +9,7 @@ from prometheus_client.core import (
 import uvicorn
 from gpustack.config.config import Config
 from gpustack.exporter.bus_metrics import BusMetricsCollector
+from gpustack.http_proxy.lb_metrics import get_lb_metrics_collector
 from gpustack.logging import setup_logging
 from gpustack.schemas.config import ModelInstanceProxyModeEnum
 from gpustack.schemas.clusters import Cluster
@@ -26,11 +27,10 @@ logger = logging.getLogger(__name__)
 
 # Prometheus label name pattern
 # https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels
-label_name_pattern = r'^[a-zA-Z_:][a-zA-Z0-9_:]*$'
+label_name_pattern = r"^[a-zA-Z_:][a-zA-Z0-9_:]*$"
 
 
 class MetricExporter(Collector):
-
     def __init__(self, cfg: Config):
         self._cache_metrics = []
         self._port = cfg.metrics_port
@@ -255,6 +255,7 @@ class MetricExporter(Collector):
         try:
             REGISTRY.register(self)
             REGISTRY.register(BusMetricsCollector())
+            REGISTRY.register(get_lb_metrics_collector())
 
             # Start FastAPI server
             app = FastAPI(
