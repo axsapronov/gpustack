@@ -176,3 +176,4 @@ charts/gpustack-chart/charts/
 !/pack/rootfs/var/**
 
 node_modules/
+docker-compose/grafana/grafana_dashboards/.dashboards.stamp

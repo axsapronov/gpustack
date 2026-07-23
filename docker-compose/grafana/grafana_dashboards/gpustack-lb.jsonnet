@@ -64,6 +64,7 @@ local section2TextContent = |||
   - **Affinity Hit Rate (%)** — процент affinity-хитов. >60% — хорошо, <30% — сессии нестабильны.
   - **Affinity Streak** — текущая серия affinity-хитов по репликам. Слишком высокие значения = монополизация.
   - **Streak Resets** — частота сбросов streak. Высокое значение = агрессивный cap или нестабильные сессии.
+  - **KV Cache Usage Over Time** — динамика raw и EWMA KV-кэша по инстансам. Сравнивайте raw с EWMA для оценки пиковости нагрузки.
   - **KV Cache Usage (raw)** — мгновенное использование KV-кэша. Показывает пиковую нагрузку на VRAM.
   - **EWMA KV Cache** — сглаженное использование KV. Сравнивайте с raw для оценки пиковости.
   - **KV Efficiency Ratio** — отношение EWMA/raw. <1 означает эффективное сглаживание пиков.
@@ -438,7 +439,7 @@ local tokenThroughputPanel = mkPanel(
   'Token Throughput',
   'Среднее количество токенов в минуту (prompt + max_tokens). Показывает общую вычислительную нагрузку.',
   queryGroup([
-    panelQuery('sum(rate(gpustack:lb_request_total_tokens_sum{job="$app_name"}[5m])) * 60', '', false, 'A'),
+    panelQuery('sum(rate(gpustack:lb_request_total_tokens_sum{job="$app_name"}[5m])) * 60', 'tokens/min', false, 'A'),
   ]),
   timeseriesViz('short'),
 );
@@ -554,6 +555,18 @@ local kvEfficiencyPanel = statPanel(
       ],
     },
   },
+);
+
+// 22. KV Cache Usage Over Time — динамика raw и EWMA по инстансам
+local kvCacheOverTimePanel = mkPanel(
+  22,
+  'KV Cache Usage Over Time',
+  'Динамика KV cache usage по инстансам во времени. Raw (сплошные линии) показывает мгновенные пики, EWMA (пунктирные) — сглаженную нагрузку. Корреляция пиков raw с падениями Affinity Hit Rate указывает на KV-индуцированные сбои affinity.',
+  queryGroup([
+    panelQuery('gpustack:lb_request_kv_cache_usage{job="$app_name"}', '{{instance_id}} (raw)', false, 'A'),
+    panelQuery('gpustack:lb_instance_ewma_kv{job="$app_name"}', '{{instance_id}} (ewma)', false, 'B'),
+  ]),
+  timeseriesViz('percentunit'),
 );
 
 // ---------------------------------------------------------------------------
@@ -710,6 +723,7 @@ local panels =
   + rawKvCachePanel
   + ewmaKvPanel
   + kvEfficiencyPanel
+  + kvCacheOverTimePanel
   // Section 3: Resource Utilization
   + totalRequestsPanel
   + instanceScorePanel
@@ -786,6 +800,7 @@ local panels =
         layoutItem(9, 0, 42, 8, 8),   // KV Cache Usage raw (bargauge)
         layoutItem(10, 8, 42, 8, 8),  // EWMA KV Cache (bargauge)
         layoutItem(11, 16, 42, 4, 8), // KV Efficiency Ratio (stat)
+        layoutItem(22, 20, 42, 4, 8), // KV Cache Usage Over Time (timeseries)
 
         // === Section 3: Resource Utilization ===
         // Row 6: text block (y=50, h=10)

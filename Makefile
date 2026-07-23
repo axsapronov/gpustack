@@ -60,7 +60,7 @@ help:
 
 
 
-GRAFANA_MONITORING_DIR := deploy/monitoring
+GRAFANA_MONITORING_DIR := docker-compose/grafana/grafana_dashboards
 GRAFANA_DASHBOARD_JSONS := \
 	$(GRAFANA_MONITORING_DIR)/gpustack-lb.json
 GRAFANA_DASHBOARD_JSONNETS := \

@@ -367,7 +367,7 @@ LB_SLOW_START_RAMP_SECONDS = float(
 # Affinity configuration
 # Affinity break multiplier: break if score(pinned) > score(best) * this ratio
 LB_AFFINITY_BREAK_MULTIPLIER = float(
-    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER", "1.2")
+    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER", "1.5")
 )
 # Max consecutive affinity hits before forced reset (prevents monopolization)
 LB_AFFINITY_MAX_STREAK = int(os.getenv("GPUSTACK_LB_AFFINITY_MAX_STREAK", "20"))
