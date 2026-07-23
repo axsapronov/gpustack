@@ -467,25 +467,60 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             pinned_id = pinned_instance.id
             pm = get_metrics(pinned_id)
 
+            # Compute best from scored candidates (needed for both break reasons)
+            best_id = min(scored, key=scored.get)
+            best_score = scored[best_id]
+            pinned_score = scored[pinned_id]
+            score_diff = pinned_score - best_score
+
             # Affinity breaker condition 1: waiting > 0
             if pm.num_waiting > 0:
                 reason = "affinity_broken_waiting"
             else:
                 # Affinity breaker condition 2: score comparison
-                best_id = min(scored, key=scored.get)
-                best_score = scored[best_id]
-                pinned_score = scored[pinned_id]
-
-                if pinned_score <= best_score * envs.LB_AFFINITY_BREAK_MULTIPLIER:
+                # Use absolute difference instead of multiplicative comparison
+                # to avoid inversion issues with negative scores (e.g. slow_start bonus).
+                # pinned_score - best_score: positive means pinned is worse than best.
+                if score_diff <= envs.LB_AFFINITY_BREAK_THRESHOLD:
                     # Affinity holds — choose pinned
                     selected = pinned_instance
                     reason = "affinity_soft"
                 else:
                     reason = "affinity_broken_score"
 
+            logger.debug(
+                "[smart_lb] affinity breaker: pinned=%d pinned_score=%.2f "
+                "best=%d best_score=%.2f diff=%.2f threshold=%.2f -> %s",
+                pinned_id,
+                pinned_score,
+                best_id,
+                best_score,
+                score_diff,
+                envs.LB_AFFINITY_BREAK_THRESHOLD,
+                reason,
+            )
+
         if reason.startswith("affinity_broken"):
+            # Record affinity break metric
+            break_reason_label = (
+                "waiting" if reason == "affinity_broken_waiting" else "score"
+            )
+            try:
+                from gpustack.http_proxy.lb_metrics import get_lb_metrics_collector
+
+                collector = get_lb_metrics_collector()
+                collector.record_affinity_break(
+                    model_id=str(pinned_instance.model_id),
+                    model_name=pinned_instance.model_name,
+                    break_reason=break_reason_label,
+                    score_diff=score_diff,
+                    pinned_instance_id=str(pinned_instance.id),
+                    best_instance_id=str(best_id),
+                )
+            except Exception:
+                pass
+
             # Affinity broken — select best from scored candidates
-            best_id = min(scored, key=scored.get)
             selected = ids_map[best_id]
             reason = "pot_score"
         elif selected is None:
@@ -498,7 +533,10 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             raise RuntimeError("No suitable instance after scoring")
 
         # Step 7: Finalize — bind affinity, update WLC/slow-start
-        await self._finalize_selection(selected, profile, now)
+        is_affinity_hit = reason == "affinity_soft"
+        await self._finalize_selection(
+            selected, profile, now, pinned_instance, is_affinity_hit
+        )
 
         # Step 8: Log selection
         self._log_selection(
@@ -567,17 +605,62 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
     # ---- Finalize ----
 
     async def _finalize_selection(
-        self, inst: ModelInstance, profile: RequestProfile, now: float
+        self,
+        inst: ModelInstance,
+        profile: RequestProfile,
+        now: float,
+        pinned_instance: Optional[ModelInstance] = None,
+        is_affinity_hit: bool = False,
     ) -> None:
         """Update state after selecting an instance."""
         async with self._lock:
-            # Bind session affinity
-            if profile.session_key:
+            # Bind session affinity only when it's an affinity hit (selected == pinned)
+            # or when there was no pinned instance at all (new binding).
+            # Don't rebind when affinity was broken and another instance was selected.
+            session_rebound = False
+            if profile.session_key and (is_affinity_hit or pinned_instance is None):
+                old_id = self._session_affinity.get(profile.session_key)
                 self._session_affinity[profile.session_key] = inst.id
+                if old_id is not None and old_id != inst.id:
+                    session_rebound = True
 
-            # Bind prefix affinity
-            if profile.prefix_key:
+            # Bind prefix affinity only when it's an affinity hit (selected == pinned)
+            # or when there was no pinned instance at all (new binding).
+            # Don't rebind when affinity was broken and another instance was selected.
+            prefix_rebound = False
+            if profile.prefix_key and (is_affinity_hit or pinned_instance is None):
+                old_id = self._prefix_affinity.get(profile.prefix_key)
                 self._prefix_affinity[profile.prefix_key] = inst.id
+                if old_id is not None and old_id != inst.id:
+                    prefix_rebound = True
+
+            # Record rebind events
+            if session_rebound or prefix_rebound:
+                try:
+                    from gpustack.http_proxy.lb_metrics import get_lb_metrics_collector
+
+                    collector = get_lb_metrics_collector()
+                    collector.record_affinity_rebind(
+                        model_id=str(inst.model_id),
+                        model_name=inst.model_name,
+                        instance_id=str(inst.id),
+                    )
+                except Exception:
+                    pass
+
+            # Record pinned count metric
+            try:
+                from gpustack.http_proxy.lb_metrics import get_lb_metrics_collector
+
+                collector = get_lb_metrics_collector()
+                pinned_count = len(self._session_affinity) + len(self._prefix_affinity)
+                collector.record_affinity_pinned(
+                    model_id=str(inst.model_id),
+                    model_name=inst.model_name,
+                    count=pinned_count,
+                )
+            except Exception:
+                pass
 
             # Add WLC weight
             self._wlc.add(inst.id, profile.total_expected_tokens)
@@ -585,8 +668,11 @@ class SmartLoadBalancingStrategy(LoadBalancingStrategy):
             # Mark active for slow start
             self._slow_start.mark_active(inst.id)
 
-            # Increment affinity streak
-            self._affinity_streak[inst.id] = self._affinity_streak.get(inst.id, 0) + 1
+            # Increment affinity streak only for affinity hits
+            if is_affinity_hit:
+                self._affinity_streak[inst.id] = (
+                    self._affinity_streak.get(inst.id, 0) + 1
+                )
 
     async def clear_affinity(self, session_key: str) -> None:
         async with self._lock:

@@ -62,6 +62,10 @@ local section2TextContent = |||
   **Что смотреть для анализа:**
   - **Affinity Efficiency** — соотношение причин селекции. Доминирование `affinity_soft` означает стабильные сессии.
   - **Affinity Hit Rate (%)** — процент affinity-хитов. >60% — хорошо, <30% — сессии нестабильны.
+  - **Affinity Break Reasons** — почему affinity ломается. `score` = pinned хуже best на величину threshold, `waiting` = pinned перегружен.
+  - **Affinity Score Diff** — разница scores pinned vs best. Положительное = pinned хуже. Чем больше, тем сильнее дисбаланс.
+  - **Affinity Rebinds** — частота перепривязки affinity на новый инстанс. Должно быть 0 после фикса.
+  - **Active Affinity Maps** — размер affinity-карт (session + prefix). Рост без уменьшения = утечка привязок.
   - **Affinity Streak** — текущая серия affinity-хитов по репликам. Слишком высокие значения = монополизация.
   - **Streak Resets** — частота сбросов streak. Высокое значение = агрессивный cap или нестабильные сессии.
   - **KV Cache Usage Over Time** — динамика raw и EWMA KV-кэша по инстансам. Сравнивайте raw с EWMA для оценки пиковости нагрузки.
@@ -569,6 +573,56 @@ local kvCacheOverTimePanel = mkPanel(
   timeseriesViz('percentunit'),
 );
 
+// 23. Affinity Break Reasons (timeseries, stacked)
+local affinityBreakReasonsPanel = mkPanel(
+  23,
+  'Affinity Break Reasons',
+  'Почему affinity ломается: score = pinned хуже best на величину threshold, waiting = pinned перегружен (num_waiting > 0). Если score доминирует — порог слишком мал.',
+  queryGroup([
+    panelQuery('sum by (break_reason, model_name) (rate(gpustack:lb_affinity_break_reasons_total{job="$app_name"}[5m])) * 60', '{{break_reason}}', false, 'A'),
+  ]),
+  timeseriesViz('rpm', true),
+);
+
+// 24. Affinity Score Diff (timeseries)
+local affinityScoreDiffPanel = mkPanel(
+  24,
+  'Affinity Score Diff',
+  'Разница scores pinned vs best (pinned_score - best_score). Положительное = pinned хуже. Чем больше, тем сильнее дисбаланс.',
+  queryGroup([
+    panelQuery('gpustack:lb_affinity_score_diff{job="$app_name"}', '{{instance_id}}', false, 'A'),
+  ]),
+  timeseriesViz('short'),
+);
+
+// 25. Affinity Rebinds (stat)
+local affinityRebindsPanel = statPanel(
+  25,
+  'Affinity Rebinds',
+  'Частота перепривязки affinity на новый инстанс. Должно быть 0 после фикса. Если > 0 — сессии действительно меняют инстанс.',
+  'sum(rate(gpustack:lb_affinity_rebind_total{job="$app_name"}[5m])) * 60',
+  {
+    unit: 'rpm',
+    thresholds: {
+      mode: 'absolute',
+      steps: [
+        { color: 'green', value: 0 },
+        { color: '#EAB839', value: 0.5 },
+        { color: 'red', value: 2 },
+      ],
+    },
+  },
+);
+
+// 26. Active Affinity Maps (stat)
+local activeAffinityMapsPanel = statPanel(
+  26,
+  'Active Affinity Maps',
+  'Размер affinity-карт (session + prefix). Рост без уменьшения = утечка affinity-привязок.',
+  'count(gpustack:lb_affinity_pinned_total{job="$app_name"})',
+  defaultField,
+);
+
 // ---------------------------------------------------------------------------
 // Section 3: Утилизация ресурсов (Resource Utilization)
 // ---------------------------------------------------------------------------
@@ -724,6 +778,10 @@ local panels =
   + ewmaKvPanel
   + kvEfficiencyPanel
   + kvCacheOverTimePanel
+  + affinityBreakReasonsPanel
+  + affinityScoreDiffPanel
+  + affinityRebindsPanel
+  + activeAffinityMapsPanel
   // Section 3: Resource Utilization
   + totalRequestsPanel
   + instanceScorePanel
@@ -794,34 +852,39 @@ local panels =
         // Row 4: timeseries + stat (y=34, h=8)
         layoutItem(5, 0, 34, 8, 8),   // Affinity Efficiency (stacked timeseries)
         layoutItem(6, 8, 34, 4, 8),   // Affinity Hit Rate (stat)
-        layoutItem(8, 12, 34, 6, 8),  // Streak Resets (timeseries)
+        layoutItem(23, 12, 34, 6, 8), // Affinity Break Reasons (stacked timeseries)
         layoutItem(7, 18, 34, 6, 8),  // Affinity Streak (bargauge)
-        // Row 5: bargauge + stat (y=42, h=8)
+        // Row 5: bargauge + stat + timeseries (y=42, h=8)
         layoutItem(9, 0, 42, 8, 8),   // KV Cache Usage raw (bargauge)
         layoutItem(10, 8, 42, 8, 8),  // EWMA KV Cache (bargauge)
-        layoutItem(11, 16, 42, 4, 8), // KV Efficiency Ratio (stat)
-        layoutItem(22, 20, 42, 4, 8), // KV Cache Usage Over Time (timeseries)
+        layoutItem(24, 16, 42, 4, 8), // Affinity Score Diff (timeseries)
+        layoutItem(25, 20, 42, 2, 8), // Affinity Rebinds (stat)
+        layoutItem(26, 22, 42, 2, 8), // Active Affinity Maps (stat)
+        // Row 6: timeseries + stat (y=50, h=8)
+        layoutItem(8, 0, 50, 8, 8),   // Streak Resets (timeseries)
+        layoutItem(11, 8, 50, 4, 8),  // KV Efficiency Ratio (stat)
+        layoutItem(22, 12, 50, 12, 8),// KV Cache Usage Over Time (timeseries)
 
         // === Section 3: Resource Utilization ===
-        // Row 6: text block (y=50, h=10)
-        layoutItem(103, 0, 50, 24, 10),
-        // Row 7: timeseries (y=60, h=8)
-        layoutItem(12, 0, 60, 8, 8),  // Requests per Replica (stacked timeseries)
-        layoutItem(14, 8, 60, 8, 8),  // Score Over Time (timeseries)
-        layoutItem(17, 16, 60, 4, 8), // Pool Size (timeseries)
-        // Row 8: bargauge + stat (y=68, h=8)
-        layoutItem(13, 0, 68, 6, 8),  // Instance Score (bargauge)
-        layoutItem(16, 6, 68, 6, 8),  // WLC Weight (bargauge)
-        layoutItem(15, 12, 68, 4, 8), // Load Imbalance Ratio (stat)
+        // Row 7: text block (y=58, h=10)
+        layoutItem(103, 0, 58, 24, 10),
+        // Row 8: timeseries (y=68, h=8)
+        layoutItem(12, 0, 68, 8, 8),  // Requests per Replica (stacked timeseries)
+        layoutItem(14, 8, 68, 8, 8),  // Score Over Time (timeseries)
+        layoutItem(17, 16, 68, 4, 8), // Pool Size (timeseries)
+        // Row 9: bargauge + stat (y=76, h=8)
+        layoutItem(13, 0, 76, 6, 8),  // Instance Score (bargauge)
+        layoutItem(16, 6, 76, 6, 8),  // WLC Weight (bargauge)
+        layoutItem(15, 12, 76, 4, 8), // Load Imbalance Ratio (stat)
 
         // === Section 4: Debug ===
-        // Row 9: text block (y=76, h=10)
-        layoutItem(104, 0, 76, 24, 10),
-        // Row 10: timeseries (y=86, h=8)
-        layoutItem(18, 0, 86, 8, 8),  // Selection Latency (timeseries)
-        layoutItem(19, 8, 86, 8, 8),  // Slow Start Weight (timeseries)
-        layoutItem(20, 16, 86, 4, 8), // Generation Tokens per Replica (stacked timeseries)
-        layoutItem(21, 20, 86, 4, 8), // Input Context per Replica (stacked timeseries)
+        // Row 10: text block (y=84, h=10)
+        layoutItem(104, 0, 84, 24, 10),
+        // Row 11: timeseries (y=94, h=8)
+        layoutItem(18, 0, 94, 8, 8),  // Selection Latency (timeseries)
+        layoutItem(19, 8, 94, 8, 8),  // Slow Start Weight (timeseries)
+        layoutItem(20, 16, 94, 4, 8), // Generation Tokens per Replica (stacked timeseries)
+        layoutItem(21, 20, 94, 4, 8), // Input Context per Replica (stacked timeseries)
       ],
     },
   },

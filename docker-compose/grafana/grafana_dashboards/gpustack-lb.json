@@ -307,7 +307,7 @@
                 "showLineNumbers": false,
                 "showMiniMap": false
               },
-              "content": "### Эффективность балансировщика (Balancer Effectiveness)\n\nСекция показывает, насколько эффективно работает стратегия балансировки — affinity, streak-лимиты, и KV-cache сглаживание.\n\n**Что смотреть для анализа:**\n- **Affinity Efficiency** — соотношение причин селекции. Доминирование `affinity_soft` означает стабильные сессии.\n- **Affinity Hit Rate (%)** — процент affinity-хитов. >60% — хорошо, <30% — сессии нестабильны.\n- **Affinity Streak** — текущая серия affinity-хитов по репликам. Слишком высокие значения = монополизация.\n- **Streak Resets** — частота сбросов streak. Высокое значение = агрессивный cap или нестабильные сессии.\n- **KV Cache Usage Over Time** — динамика raw и EWMA KV-кэша по инстансам. Сравнивайте raw с EWMA для оценки пиковости нагрузки.\n- **KV Cache Usage (raw)** — мгновенное использование KV-кэша. Показывает пиковую нагрузку на VRAM.\n- **EWMA KV Cache** — сглаженное использование KV. Сравнивайте с raw для оценки пиковости.\n- **KV Efficiency Ratio** — отношение EWMA/raw. <1 означает эффективное сглаживание пиков.\n",
+              "content": "### Эффективность балансировщика (Balancer Effectiveness)\n\nСекция показывает, насколько эффективно работает стратегия балансировки — affinity, streak-лимиты, и KV-cache сглаживание.\n\n**Что смотреть для анализа:**\n- **Affinity Efficiency** — соотношение причин селекции. Доминирование `affinity_soft` означает стабильные сессии.\n- **Affinity Hit Rate (%)** — процент affinity-хитов. >60% — хорошо, <30% — сессии нестабильны.\n- **Affinity Break Reasons** — почему affinity ломается. `score` = pinned хуже best на величину threshold, `waiting` = pinned перегружен.\n- **Affinity Score Diff** — разница scores pinned vs best. Положительное = pinned хуже. Чем больше, тем сильнее дисбаланс.\n- **Affinity Rebinds** — частота перепривязки affinity на новый инстанс. Должно быть 0 после фикса.\n- **Active Affinity Maps** — размер affinity-карт (session + prefix). Рост без уменьшения = утечка привязок.\n- **Affinity Streak** — текущая серия affinity-хитов по репликам. Слишком высокие значения = монополизация.\n- **Streak Resets** — частота сбросов streak. Высокое значение = агрессивный cap или нестабильные сессии.\n- **KV Cache Usage Over Time** — динамика raw и EWMA KV-кэша по инстансам. Сравнивайте raw с EWMA для оценки пиковости нагрузки.\n- **KV Cache Usage (raw)** — мгновенное использование KV-кэша. Показывает пиковую нагрузку на VRAM.\n- **EWMA KV Cache** — сглаженное использование KV. Сравнивайте с raw для оценки пиковости.\n- **KV Efficiency Ratio** — отношение EWMA/raw. <1 означает эффективное сглаживание пиков.\n",
               "mode": "markdown"
             }
           },
@@ -1919,6 +1919,416 @@
         }
       }
     },
+    "panel-23": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum by (break_reason, model_name) (rate(gpustack:lb_affinity_break_reasons_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{break_reason}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Почему affinity ломается: score = pinned хуже best на величину threshold, waiting = pinned перегружен (num_waiting > 0). Если score доминирует — порог слишком мал.",
+        "id": 23,
+        "links": [],
+        "title": "Affinity Break Reasons",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 20,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "multi",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-24": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "gpustack:lb_affinity_score_diff{job=\"$app_name\"}",
+                      "instant": false,
+                      "interval": "",
+                      "legendFormat": "{{instance_id}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Разница scores pinned vs best (pinned_score - best_score). Положительное = pinned хуже. Чем больше, тем сильнее дисбаланс.",
+        "id": 24,
+        "links": [],
+        "title": "Affinity Score Diff",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "axisBorderShow": false,
+                  "axisCenteredZero": false,
+                  "axisColorMode": "text",
+                  "axisLabel": "",
+                  "axisPlacement": "auto",
+                  "barAlignment": 0,
+                  "barWidthFactor": 0.6,
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "gradientMode": "none",
+                  "hideFrom": {
+                    "legend": false,
+                    "tooltip": false,
+                    "viz": false
+                  },
+                  "insertNulls": false,
+                  "lineInterpolation": "linear",
+                  "lineWidth": 1,
+                  "pointSize": 5,
+                  "scaleDistribution": {
+                    "type": "linear"
+                  },
+                  "showPoints": "auto",
+                  "showValues": false,
+                  "spanNulls": false,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "none"
+                  },
+                  "thresholdsStyle": {
+                    "mode": "off"
+                  }
+                },
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "enableFacetedFilter": false,
+                "overflow": "ellipsis",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "hideZeros": false,
+                "mode": "single",
+                "sort": "none"
+              }
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-25": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "sum(rate(gpustack:lb_affinity_rebind_total{job=\"$app_name\"}[5m])) * 60",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Частота перепривязки affinity на новый инстанс. Должно быть 0 после фикса. Если > 0 — сессии действительно меняют инстанс.",
+        "id": 25,
+        "links": [],
+        "title": "Affinity Rebinds",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 2
+                    }
+                  ]
+                },
+                "unit": "rpm"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
+    "panel-26": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "${DS_PROMETHEUS}"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "exemplar": true,
+                      "expr": "count(gpustack:lb_affinity_pinned_total{job=\"$app_name\"})",
+                      "instant": true,
+                      "interval": "",
+                      "legendFormat": "",
+                      "range": false
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Размер affinity-карт (session + prefix). Рост без уменьшения = утечка affinity-привязок.",
+        "id": 26,
+        "links": [],
+        "title": "Active Affinity Maps",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "13.1.0"
+        }
+      }
+    },
     "panel-3": {
       "kind": "Panel",
       "spec": {
@@ -2861,7 +3271,7 @@
           "spec": {
             "element": {
               "kind": "ElementReference",
-              "name": "panel-8"
+              "name": "panel-23"
             },
             "height": 8,
             "width": 6,
@@ -2913,7 +3323,7 @@
           "spec": {
             "element": {
               "kind": "ElementReference",
-              "name": "panel-11"
+              "name": "panel-24"
             },
             "height": 8,
             "width": 4,
@@ -2926,12 +3336,64 @@
           "spec": {
             "element": {
               "kind": "ElementReference",
-              "name": "panel-22"
+              "name": "panel-25"
+            },
+            "height": 8,
+            "width": 2,
+            "x": 20,
+            "y": 42
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-26"
+            },
+            "height": 8,
+            "width": 2,
+            "x": 22,
+            "y": 42
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-8"
+            },
+            "height": 8,
+            "width": 8,
+            "x": 0,
+            "y": 50
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-11"
             },
             "height": 8,
             "width": 4,
-            "x": 20,
-            "y": 42
+            "x": 8,
+            "y": 50
+          }
+        },
+        {
+          "kind": "GridLayoutItem",
+          "spec": {
+            "element": {
+              "kind": "ElementReference",
+              "name": "panel-22"
+            },
+            "height": 8,
+            "width": 12,
+            "x": 12,
+            "y": 50
           }
         },
         {
@@ -2944,7 +3406,7 @@
             "height": 10,
             "width": 24,
             "x": 0,
-            "y": 50
+            "y": 58
           }
         },
         {
@@ -2957,7 +3419,7 @@
             "height": 8,
             "width": 8,
             "x": 0,
-            "y": 60
+            "y": 68
           }
         },
         {
@@ -2970,7 +3432,7 @@
             "height": 8,
             "width": 8,
             "x": 8,
-            "y": 60
+            "y": 68
           }
         },
         {
@@ -2983,7 +3445,7 @@
             "height": 8,
             "width": 4,
             "x": 16,
-            "y": 60
+            "y": 68
           }
         },
         {
@@ -2996,7 +3458,7 @@
             "height": 8,
             "width": 6,
             "x": 0,
-            "y": 68
+            "y": 76
           }
         },
         {
@@ -3009,7 +3471,7 @@
             "height": 8,
             "width": 6,
             "x": 6,
-            "y": 68
+            "y": 76
           }
         },
         {
@@ -3022,7 +3484,7 @@
             "height": 8,
             "width": 4,
             "x": 12,
-            "y": 68
+            "y": 76
           }
         },
         {
@@ -3035,7 +3497,7 @@
             "height": 10,
             "width": 24,
             "x": 0,
-            "y": 76
+            "y": 84
           }
         },
         {
@@ -3048,7 +3510,7 @@
             "height": 8,
             "width": 8,
             "x": 0,
-            "y": 86
+            "y": 94
           }
         },
         {
@@ -3061,7 +3523,7 @@
             "height": 8,
             "width": 8,
             "x": 8,
-            "y": 86
+            "y": 94
           }
         },
         {
@@ -3074,7 +3536,7 @@
             "height": 8,
             "width": 4,
             "x": 16,
-            "y": 86
+            "y": 94
           }
         },
         {
@@ -3087,7 +3549,7 @@
             "height": 8,
             "width": 4,
             "x": 20,
-            "y": 86
+            "y": 94
           }
         }
       ]
@@ -3212,5 +3674,5 @@
       }
     }
   ],
-  "version": 10
+  "version": 11
 }

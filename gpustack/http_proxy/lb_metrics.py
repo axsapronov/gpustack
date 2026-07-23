@@ -79,6 +79,12 @@ class LBMetricsCollector(Collector):
         self._requests: Dict[Tuple[str, str, str], int] = {}
         # (model_id, model_name, instance_id) -> count
         self._streak_resets: Dict[Tuple[str, str, str], int] = {}
+        # (model_id, model_name, break_reason) -> count
+        # break_reason: "waiting" (num_waiting > 0), "score" (score_diff > threshold)
+        self._affinity_break_reasons: Dict[Tuple[str, str, str], int] = {}
+        # (model_id, model_name, instance_id) -> count
+        # Counts how many times affinity rebound to a new instance
+        self._affinity_rebinds: Dict[Tuple[str, str, str], int] = {}
 
         # --- Gauges (latest snapshot) ---
         # (model_id, model_name, instance_id) -> value
@@ -90,6 +96,11 @@ class LBMetricsCollector(Collector):
         self._instance_kv_cache: Dict[Tuple[str, str, str], float] = {}
         # (model_id, model_name) -> pool_size
         self._pool_size: Dict[Tuple[str, str], int] = {}
+        # (model_id, model_name, instance_id) -> pinned_score - best_score
+        # Recorded at the time of affinity breaker decision
+        self._affinity_score_diff: Dict[Tuple[str, str, str], float] = {}
+        # (model_id, model_name) -> number of unique pinned sessions/prefixes in memory
+        self._affinity_pinned: Dict[Tuple[str, str], int] = {}
 
         # --- Histograms (bucketed samples) ---
         # (model_id, model_name, route) -> list of values
@@ -173,6 +184,43 @@ class LBMetricsCollector(Collector):
             key = (model_id, model_name, instance_id)
             self._streak_resets[key] = self._streak_resets.get(key, 0) + 1
 
+    def record_affinity_break(
+        self,
+        model_id: str,
+        model_name: str,
+        break_reason: str,
+        score_diff: float,
+        pinned_instance_id: str,
+        best_instance_id: str,
+    ) -> None:
+        """Record an affinity break event.
+
+        Call when affinity is broken (either by waiting > 0 or score difference).
+        """
+        with self._lock:
+            key = (model_id, model_name, break_reason)
+            self._affinity_break_reasons[key] = (
+                self._affinity_break_reasons.get(key, 0) + 1
+            )
+            # Record score diff for the pinned instance
+            diff_key = (model_id, model_name, pinned_instance_id)
+            self._affinity_score_diff[diff_key] = score_diff
+
+    def record_affinity_rebind(
+        self, model_id: str, model_name: str, instance_id: str
+    ) -> None:
+        """Record an affinity rebind event (affinity bound to a new instance)."""
+        with self._lock:
+            key = (model_id, model_name, instance_id)
+            self._affinity_rebinds[key] = self._affinity_rebinds.get(key, 0) + 1
+
+    def record_affinity_pinned(
+        self, model_id: str, model_name: str, count: int
+    ) -> None:
+        """Record the number of unique pinned sessions/prefixes in memory."""
+        with self._lock:
+            self._affinity_pinned[(model_id, model_name)] = count
+
     # ---- Prometheus collect() ----
 
     def collect(self) -> Iterator[Metric]:
@@ -182,8 +230,12 @@ class LBMetricsCollector(Collector):
         yield from self._yield_selections(snapshot)
         yield from self._yield_requests(snapshot)
         yield from self._yield_streak_resets(snapshot)
+        yield from self._yield_affinity_break_reasons(snapshot)
+        yield from self._yield_affinity_rebinds(snapshot)
         yield from self._yield_instance_gauges(snapshot)
         yield from self._yield_pool_size(snapshot)
+        yield from self._yield_affinity_score_diff(snapshot)
+        yield from self._yield_affinity_pinned(snapshot)
         yield from self._yield_prompt_tokens(snapshot)
         yield from self._yield_max_tokens(snapshot)
         yield from self._yield_total_tokens(snapshot)
@@ -195,6 +247,8 @@ class LBMetricsCollector(Collector):
             "selections": dict(self._selections),
             "requests": dict(self._requests),
             "streak_resets": dict(self._streak_resets),
+            "affinity_break_reasons": dict(self._affinity_break_reasons),
+            "affinity_rebinds": dict(self._affinity_rebinds),
             "instance_score": dict(self._instance_score),
             "instance_ewma_kv": dict(self._instance_ewma_kv),
             "instance_wlc_weight": dict(self._instance_wlc_weight),
@@ -202,6 +256,8 @@ class LBMetricsCollector(Collector):
             "instance_affinity_streak": dict(self._instance_affinity_streak),
             "instance_kv_cache": dict(self._instance_kv_cache),
             "pool_size": dict(self._pool_size),
+            "affinity_score_diff": dict(self._affinity_score_diff),
+            "affinity_pinned": dict(self._affinity_pinned),
             "prompt_tokens": dict(self._prompt_tokens),
             "max_tokens": dict(self._max_tokens),
             "total_tokens": dict(self._total_tokens),
@@ -239,6 +295,30 @@ class LBMetricsCollector(Collector):
             labels=["model_id", "model_name", "instance_id"],
         )
         for (model_id, model_name, instance_id), count in snap["streak_resets"].items():
+            fam.add_metric([model_id, model_name, instance_id], count)
+        yield fam
+
+    def _yield_affinity_break_reasons(self, snap: dict) -> Iterator[Metric]:
+        fam = CounterMetricFamily(
+            metric_name("lb_affinity_break_reasons_total"),
+            "Total number of affinity breaks by reason (waiting or score).",
+            labels=["model_id", "model_name", "break_reason"],
+        )
+        for (model_id, model_name, break_reason), count in snap[
+            "affinity_break_reasons"
+        ].items():
+            fam.add_metric([model_id, model_name, break_reason], count)
+        yield fam
+
+    def _yield_affinity_rebinds(self, snap: dict) -> Iterator[Metric]:
+        fam = CounterMetricFamily(
+            metric_name("lb_affinity_rebind_total"),
+            "Total number of affinity rebind events (affinity bound to new instance).",
+            labels=["model_id", "model_name", "instance_id"],
+        )
+        for (model_id, model_name, instance_id), count in snap[
+            "affinity_rebinds"
+        ].items():
             fam.add_metric([model_id, model_name, instance_id], count)
         yield fam
 
@@ -304,6 +384,26 @@ class LBMetricsCollector(Collector):
         )
         for (model_id, model_name), size in snap["pool_size"].items():
             fam.add_metric([model_id, model_name], size)
+        yield fam
+
+    def _yield_affinity_score_diff(self, snap: dict) -> Iterator[Metric]:
+        fam = GaugeMetricFamily(
+            metric_name("lb_affinity_score_diff"),
+            "Score difference (pinned_score - best_score) at last affinity breaker decision.",
+            labels=["model_id", "model_name", "instance_id"],
+        )
+        for key, val in snap["affinity_score_diff"].items():
+            fam.add_metric(list(key), val)
+        yield fam
+
+    def _yield_affinity_pinned(self, snap: dict) -> Iterator[Metric]:
+        fam = GaugeMetricFamily(
+            metric_name("lb_affinity_pinned_total"),
+            "Number of unique pinned sessions/prefixes in memory.",
+            labels=["model_id", "model_name"],
+        )
+        for (model_id, model_name), count in snap["affinity_pinned"].items():
+            fam.add_metric([model_id, model_name], count)
         yield fam
 
     # ---- Histogram yielders ----

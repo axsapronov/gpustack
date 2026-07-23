@@ -365,9 +365,17 @@ LB_SLOW_START_RAMP_SECONDS = float(
 )
 
 # Affinity configuration
-# Affinity break multiplier: break if score(pinned) > score(best) * this ratio
-LB_AFFINITY_BREAK_MULTIPLIER = float(
-    os.getenv("GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER", "1.5")
+# Affinity break threshold: break if pinned_score - best_score > this absolute threshold.
+# A lower pinned_score is better, so a positive diff means pinned is worse than best.
+# Backward compat: GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER is deprecated but still honored.
+_lb_affinity_break_threshold = os.getenv("GPUSTACK_LB_AFFINITY_BREAK_THRESHOLD", "")
+_lb_affinity_break_multiplier_legacy = os.getenv(
+    "GPUSTACK_LB_AFFINITY_BREAK_MULTIPLIER", ""
+)
+LB_AFFINITY_BREAK_THRESHOLD = float(
+    _lb_affinity_break_threshold
+    if _lb_affinity_break_threshold
+    else _lb_affinity_break_multiplier_legacy or "1.5"
 )
 # Max consecutive affinity hits before forced reset (prevents monopolization)
 LB_AFFINITY_MAX_STREAK = int(os.getenv("GPUSTACK_LB_AFFINITY_MAX_STREAK", "20"))
