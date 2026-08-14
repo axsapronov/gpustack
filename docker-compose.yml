@@ -1,0 +1,27 @@
+# Development docker-compose for GPUStack
+# Mount persistent data volume for database storage.
+# Volume mounts for gpustack-lb integration patches (overriding individual files).
+services:
+  gpustack:
+    image: gpustack/gpustack:dev
+    container_name: gpustack
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Persistent data
+      - gpustack-data:/var/lib/gpustack
+      # gpustack-lb integration patches (thin adapter + updated imports)
+      - ./patches/gpustack/http_proxy/gpustack_lb_adapter.py:/usr/local/lib/python3.11/site-packages/gpustack/http_proxy/gpustack_lb_adapter.py
+      - ./patches/gpustack/routes/openai.py:/usr/local/lib/python3.11/site-packages/gpustack/routes/openai.py
+    command: --database-url ${GPUSTACK_DATABASE_URL} --disable-worker --server-external-url ${GPUSTACK_SERVER_EXTERNAL_URL:-http://localhost}
+    env_file:
+      - .env
+    healthcheck:
+      test: curl --fail ${GPUSTACK_SERVER_EXTERNAL_URL:-http://localhost}/healthz || exit 1
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+
+volumes:
+  gpustack-data:
