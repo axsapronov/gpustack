@@ -2,6 +2,7 @@ import json
 import re
 import random
 import asyncio
+import time
 from typing import AsyncGenerator, List, Optional, Tuple, Union, Dict
 import aiohttp
 import logging
@@ -26,6 +27,8 @@ from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
 from gpustack.http_proxy.gpustack_lb_adapter import (
     select_instance as lb_select_instance,
+    record_request_success as lb_record_request_success,
+    record_request_failure as lb_record_request_failure,
 )
 from gpustack.routes.model_common import build_category_conditions
 from gpustack.schemas.models import Model
@@ -273,6 +276,9 @@ async def proxy_request_by_model(
         f"proxying to {instance.worker_ip}:{instance.port}, instance port: {instance.port}"
     )
 
+    started = time.monotonic()
+    model_id = model.id
+    instance_id = instance.id
     try:
         headers, data = _prepare_proxy_request(
             request,
@@ -283,7 +289,7 @@ async def proxy_request_by_model(
         )
         if stream:
             return StreamingResponseWithStatusCode(
-                _stream_response(
+                _stream_response_with_lb_feedback(
                     worker,
                     request.method,
                     path,
@@ -291,6 +297,9 @@ async def proxy_request_by_model(
                     data,
                     request.app.state.http_client,
                     request.app.state.http_client_no_proxy,
+                    model_id=model_id,
+                    instance_id=instance_id,
+                    started=started,
                 ),
                 media_type="text/event-stream",
             )
@@ -305,12 +314,18 @@ async def proxy_request_by_model(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT),
             )
+            latency_ms = (time.monotonic() - started) * 1000.0
+            if resp.status >= 500:
+                lb_record_request_failure(model_id, instance_id, "http_5xx")
+            else:
+                lb_record_request_success(model_id, instance_id, latency_ms)
             return Response(
                 status_code=resp.status,
                 headers=dict(resp.headers),
                 content=body,
             )
     except asyncio.TimeoutError as e:
+        lb_record_request_failure(model_id, instance_id, "timeout")
         error_message = f"Request to worker {worker.id} timed out"
         if str(e):
             error_message += f": {e}"
@@ -319,6 +334,7 @@ async def proxy_request_by_model(
             is_openai_exception=True,
         )
     except Exception as e:
+        lb_record_request_failure(model_id, instance_id, "proxy_error")
         error_message = "An unexpected error occurred"
         if str(e):
             error_message += f": {e}"
@@ -475,6 +491,49 @@ async def _stream_response(
         yield _error_chunk(
             error_response, yielded_any
         ), {}, status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+async def _stream_response_with_lb_feedback(
+    worker: Worker,
+    method: str,
+    path: str,
+    headers: Dict[str, str],
+    data: Optional[Union[bytes, aiohttp.FormData]],
+    proxy_client: aiohttp.ClientSession,
+    no_proxy_client: aiohttp.ClientSession,
+    model_id: int,
+    instance_id: int,
+    started: float,
+) -> AsyncGenerator[Tuple[Union[bytes, str], Dict[str, str], int], None]:
+    """Wrap streaming proxy and report outcome to gpustack-lb."""
+    status_code: Optional[int] = None
+    had_error = False
+    try:
+        async for chunk, resp_headers, resp_status in _stream_response(
+            worker,
+            method,
+            path,
+            headers,
+            data,
+            proxy_client,
+            no_proxy_client,
+        ):
+            status_code = resp_status
+            if resp_status >= 500:
+                had_error = True
+            yield chunk, resp_headers, resp_status
+    except Exception:
+        had_error = True
+        raise
+    finally:
+        latency_ms = (time.monotonic() - started) * 1000.0
+        if had_error or (status_code is not None and status_code >= 500):
+            error_type = (
+                "http_5xx" if status_code and status_code >= 500 else "stream_error"
+            )
+            lb_record_request_failure(model_id, instance_id, error_type)
+        elif status_code is not None:
+            lb_record_request_success(model_id, instance_id, latency_ms)
 
 
 def _error_chunk(error_response: OpenAIAPIErrorResponse, mid_stream: bool) -> str:

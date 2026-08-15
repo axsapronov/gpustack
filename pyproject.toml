@@ -75,7 +75,7 @@ dependencies = [
 
 [project.optional-dependencies]
 lb = [
-    "gpustack-lb>=0.1.3",
+    "gpustack-lb>=0.1.4",
 ]
 
 [dependency-groups]

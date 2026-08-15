@@ -55,6 +55,20 @@ async def select_instance(
     return await lb.get_instance(available_instances)
 
 
+def record_request_success(model_id: int, instance_id: int, latency_ms: float) -> None:
+    """Feed successful proxy outcome into gpustack-lb health + Prometheus."""
+    if _integration:
+        _integration.record_request_success(model_id, instance_id, latency_ms)
+
+
+def record_request_failure(
+    model_id: int, instance_id: int, error_type: str = "unknown"
+) -> None:
+    """Feed failed proxy outcome into gpustack-lb health + Prometheus."""
+    if _integration:
+        _integration.record_request_failure(model_id, instance_id, error_type)
+
+
 def start_lb_metrics_cache(get_instances_fn):
     """Start the background metrics cache task.
 
